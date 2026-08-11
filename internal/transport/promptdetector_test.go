@@ -78,6 +78,53 @@ func TestWaitForPromptSuccess(t *testing.T) {
 	}
 }
 
+// TestWaitForPromptContinuesThroughPagination is the regression test for
+// a real-hardware finding: a long "show" command's output paused at a
+// "--More--"-style pagination prompt, which the quiescence fallback
+// (added for mode-changing commands) mistook for command completion,
+// silently truncating the result at the first page. waitForPrompt must
+// recognize the pagination marker, send a continuation keystroke, and
+// keep accumulating -- returning output from every page, with the marker
+// itself stripped out as navigation noise rather than left embedded in
+// the result.
+func TestWaitForPromptContinuesThroughPagination(t *testing.T) {
+	pageTwoSent := false
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		switch written {
+		case "show ont-info all" + crlf:
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("show ont-info all\r\nrow1\r\nrow2\r\n--More--")
+			}()
+		case paginationContinueKeystroke:
+			if pageTwoSent {
+				return
+			}
+			pageTwoSent = true
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("\r\nrow3\r\nrow4\r\nOLT#")
+			}()
+		}
+	})
+
+	output, nextPrompt, err := waitForPrompt(source, "show ont-info all", "OLT#", 5*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(strings.ToLower(output), "more") {
+		t.Errorf("expected the pagination marker to be stripped, got %q", output)
+	}
+	for _, want := range []string{"row1", "row2", "row3", "row4"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("expected output to contain %q (from both pages), got %q", want, output)
+		}
+	}
+	if nextPrompt != "OLT#" {
+		t.Errorf("got nextPrompt %q, want %q", nextPrompt, "OLT#")
+	}
+}
+
 // TestWaitForPromptDetectsChangedPrompt is the regression test for a
 // real-hardware finding: a command that changes the prompt itself (e.g.
 // entering config mode, "OLT>" -> "OLT(config)#") never makes the OLD
@@ -208,6 +255,32 @@ func TestStripEchoAndPrompt(t *testing.T) {
 			got := stripEchoAndPrompt(tc.raw, tc.command, tc.prompt)
 			if got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPaginationMarkerPattern(t *testing.T) {
+	cases := []struct {
+		line string
+		want bool
+	}{
+		{"--More--", true},
+		{"-- More --", true},
+		{"---- More ----", true},
+		{"(more)", true},
+		{"( More )", true},
+		{"Press any key to continue", true},
+		{"press any key", true},
+		{"row of real data with more columns than usual", false},
+		{"3 more ONTs configured", false},
+		{"OLT#", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.line, func(t *testing.T) {
+			if got := paginationMarkerPattern.MatchString(tc.line); got != tc.want {
+				t.Errorf("paginationMarkerPattern.MatchString(%q) = %v, want %v", tc.line, got, tc.want)
 			}
 		})
 	}

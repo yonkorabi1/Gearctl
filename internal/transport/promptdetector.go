@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"regexp"
 	"strings"
 	"time"
 
@@ -27,6 +28,24 @@ const commandQuiescenceMs = 2000
 // forgiving of a bare LF, but there's no reason not to send the
 // protocol-correct terminator everywhere this shared code is used.
 const crlf = "\r\n"
+
+// paginationMarkerPattern matches common "there's more, press a key"
+// pagination prompts used across vendors -- e.g. "--More--", "-- More --",
+// "(more)", "Press any key to continue". Deliberately broad enough to
+// catch dash/paren-decorated variants but NOT a bare trailing "more"
+// (too easy to false-positive on genuine output that happens to end with
+// that word). A false negative here just means paginated output looks
+// like any other quiescence-fallback case (silently truncated at the
+// pause, the pre-existing behavior); a false positive costs one harmless
+// extra continuation keystroke sent to a device that had nothing more to
+// show, which is a no-op.
+var paginationMarkerPattern = regexp.MustCompile(`(?i)-{2,}\s*more\s*-{2,}|\(\s*more\s*\)|press\s+any\s+key`)
+
+// paginationContinueKeystroke is what advances a paginated CLI to the next
+// page -- a bare space with no line ending, matching the traditional
+// Unix `more`/`less` and Cisco "--More--" convention (unlike a normal
+// command, this isn't a line to submit, just a single keypress).
+const paginationContinueKeystroke = " "
 
 // waitForQuiescence accumulates bytes from source until no new data has
 // arrived for quiescenceMs, or maxWait elapses (safety cap for a device
@@ -156,6 +175,26 @@ func waitForPrompt(source *DataSource, command, promptText string, timeout time.
 				quietTimer.Reset(commandQuiescenceMs * time.Millisecond)
 				continue
 			}
+			if paginationMarkerPattern.MatchString(lastNonEmptyLine(settled)) {
+				// Not command completion -- the device is paused waiting
+				// for a keypress to show the next page. Confirmed live:
+				// without this, a long "show" enumerating many ONUs got
+				// silently truncated at the first page, with the
+				// pagination marker itself mistaken for (and stripped
+				// away as) a new prompt -- the operator just saw a
+				// partial table with no indication anything was missing.
+				if err := source.Write(paginationContinueKeystroke); err != nil {
+					return "", "", olterr.New(olterr.TypeConnection, "failed to write pagination continuation: "+err.Error())
+				}
+				if !quietTimer.Stop() {
+					select {
+					case <-quietTimer.C:
+					default:
+					}
+				}
+				quietTimer.Reset(commandQuiescenceMs * time.Millisecond)
+				continue
+			}
 			newPrompt := lastNonEmptyLine(settled)
 			if newPrompt == "" {
 				newPrompt = promptText
@@ -186,5 +225,22 @@ func stripEchoAndPrompt(raw, command, promptText string) string {
 	text = strings.TrimPrefix(text, "\n")
 	text = strings.TrimSuffix(text, "\r\n")
 	text = strings.TrimSuffix(text, "\n")
-	return text
+	return stripPaginationMarkerLines(text)
+}
+
+// stripPaginationMarkerLines removes any line matching
+// paginationMarkerPattern. Output accumulated across one or more
+// pagination continuations (see waitForPrompt) has one of these per page
+// boundary, sitting in the MIDDLE of the text, not just at the very end --
+// they're page-navigation noise, not part of the device's actual answer.
+func stripPaginationMarkerLines(text string) string {
+	lines := strings.Split(text, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if paginationMarkerPattern.MatchString(l) {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	return strings.Join(kept, "\n")
 }
