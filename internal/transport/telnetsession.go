@@ -335,14 +335,14 @@ func runLoginSequence(source *DataSource, params ConnectionParams) error {
 	if _, err := waitForSubstring(source, []*regexp.Regexp{loginPattern, usernamePattern}, connectTimeout); err != nil {
 		return err
 	}
-	if err := source.Write(params.Username + "\n"); err != nil {
+	if err := source.Write(params.Username + crlf); err != nil {
 		return olterr.New(olterr.TypeConnection, "failed to write username: "+err.Error())
 	}
 
 	if _, err := waitForSubstring(source, []*regexp.Regexp{passwordPattern}, connectTimeout); err != nil {
 		return err
 	}
-	if err := source.Write(params.Password + "\n"); err != nil {
+	if err := source.Write(params.Password + crlf); err != nil {
 		return olterr.New(olterr.TypeConnection, "failed to write password: "+err.Error())
 	}
 
@@ -356,7 +356,7 @@ func runLoginSequence(source *DataSource, params ConnectionParams) error {
 			shortTimeout = 3 * time.Second
 		}
 		if _, err := waitForSubstring(source, []*regexp.Regexp{passwordPattern}, shortTimeout); err == nil {
-			_ = source.Write(params.EnablePassword + "\n")
+			_ = source.Write(params.EnablePassword + crlf)
 		}
 	}
 

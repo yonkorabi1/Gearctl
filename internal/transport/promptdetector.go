@@ -9,6 +9,16 @@ import (
 
 const defaultQuiescenceMs = 300
 
+// crlf is the NVT (Network Virtual Terminal) line ending per RFC 854 --
+// Telnet defines a line ending as CR LF, not a bare LF. Confirmed live
+// against a real OLT (packet capture + a manual telnet session that DID
+// complete a full login, unlike this client): sending a bare "\n" got the
+// device to echo back what was typed but never advance past it -- it was
+// still waiting for the actual line terminator. SSH PTYs are generally
+// forgiving of a bare LF, but there's no reason not to send the
+// protocol-correct terminator everywhere this shared code is used.
+const crlf = "\r\n"
+
 // waitForQuiescence accumulates bytes from source until no new data has
 // arrived for quiescenceMs, or maxWait elapses (safety cap for a device
 // that never goes quiet -- e.g. a broken/chatty CLI). Returns everything
@@ -48,7 +58,7 @@ func waitForQuiescence(source *DataSource, quiescence, maxWait time.Duration) st
 // interpreted here; matching in waitForPrompt below is a plain substring
 // check.
 func capturePrompt(source *DataSource, maxWaitMs int) (string, error) {
-	if err := source.Write("\n"); err != nil {
+	if err := source.Write(crlf); err != nil {
 		return "", olterr.New(olterr.TypeConnection, "failed to write to session: "+err.Error())
 	}
 	settled := waitForQuiescence(source, defaultQuiescenceMs*time.Millisecond, time.Duration(maxWaitMs)*time.Millisecond)
@@ -77,7 +87,7 @@ func capturePrompt(source *DataSource, maxWaitMs int) (string, error) {
 // olterr.OltCliError with Type "timeout" -- the caller MUST treat the
 // session as unusable afterward (see ShellSession's contract).
 func waitForPrompt(source *DataSource, command, promptText string, timeout time.Duration) (string, error) {
-	if err := source.Write(command + "\n"); err != nil {
+	if err := source.Write(command + crlf); err != nil {
 		return "", olterr.New(olterr.TypeConnection, "failed to write to session: "+err.Error())
 	}
 
