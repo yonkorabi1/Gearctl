@@ -34,6 +34,35 @@ func TestTelnetIacParserStripsSimpleNegotiationAndReplies(t *testing.T) {
 	}
 }
 
+// TestTelnetIacParserRefusesWillOfferWithDont is the regression test for a
+// real-hardware bug found via packet capture: a peer's WILL offer (e.g. a
+// real OLT sending "IAC WILL ECHO") must be refused with DONT, not WONT --
+// WONT is a statement about our own behavior and is a malformed reply to a
+// WILL offer, even though the OLT that surfaced this tolerated it.
+func TestTelnetIacParserRefusesWillOfferWithDont(t *testing.T) {
+	conn := &fakeConn{}
+	parser := newTelnetIacParser(conn)
+
+	out := parser.feed([]byte{iacByte, willByte, 1}) // peer offers WILL ECHO
+	if len(out) != 0 {
+		t.Fatalf("got %q, want no plain-text output", out)
+	}
+	want := []byte{iacByte, dontByte, 1}
+	if string(conn.written) != string(want) {
+		t.Fatalf("got reply %v, want %v (DONT, not WONT)", conn.written, want)
+	}
+}
+
+func TestTelnetIacParserDoesNotReplyToWontOrDont(t *testing.T) {
+	conn := &fakeConn{}
+	parser := newTelnetIacParser(conn)
+
+	parser.feed([]byte{iacByte, wontByte, 1, iacByte, dontByte, 3})
+	if len(conn.written) != 0 {
+		t.Fatalf("did not expect any reply to WONT/DONT, got %v", conn.written)
+	}
+}
+
 func TestTelnetIacParserHandlesNegotiationSplitAcrossChunks(t *testing.T) {
 	conn := &fakeConn{}
 	parser := newTelnetIacParser(conn)
@@ -179,6 +208,71 @@ func TestOpenTelnetSessionSurvivesTtypeNegotiation(t *testing.T) {
 	}
 	if output != "OLT-Gateway-Mock v1.0" {
 		t.Errorf("got output %q, want %q", output, "OLT-Gateway-Mock v1.0")
+	}
+}
+
+// TestOpenTelnetSessionRetriesOnceOnSilentConnection is the regression
+// test for the second real-hardware finding (via packet capture): a first
+// Telnet connection that goes completely silent shouldn't surface as a
+// failure if a second, fresh connection succeeds -- confirmed live against
+// a real OLT where the first connection from a given source IP got zero
+// bytes back, but a second connection immediately after got the full
+// banner and login prompt.
+func TestOpenTelnetSessionRetriesOnceOnSilentConnection(t *testing.T) {
+	host, port := startMockTelnetServer(t, mockTelnetServerOpts{
+		username:          "admin",
+		password:          "s3cret",
+		responses:         map[string]string{"show version": "OLT-Gateway-Mock v1.0"},
+		silentConnections: 1, // the first connection accepted gets nothing written to it
+	})
+
+	session, err := OpenTelnetSession(ConnectionParams{
+		Host:                host,
+		Port:                port,
+		Protocol:            "telnet",
+		Username:            "admin",
+		Password:            "s3cret",
+		// Short on purpose -- the first (silent) connection attempt needs
+		// to time out quickly for this test to run fast; the retry's
+		// connection succeeds near-instantly against the mock server.
+		ConnectTimeoutMs:    300,
+		PerCommandTimeoutMs: 2000,
+	})
+	if err != nil {
+		t.Fatalf("OpenTelnetSession failed despite the retry: %v", err)
+	}
+	defer session.Close()
+
+	output, _, err := session.SendAndWaitForPrompt("show version", 2*time.Second)
+	if err != nil {
+		t.Fatalf("SendAndWaitForPrompt failed: %v", err)
+	}
+	if output != "OLT-Gateway-Mock v1.0" {
+		t.Errorf("got output %q, want %q", output, "OLT-Gateway-Mock v1.0")
+	}
+}
+
+// TestOpenTelnetSessionDoesNotRetryForeverOnPersistentSilence confirms the
+// retry is bounded to exactly one extra attempt, not an unbounded loop --
+// a server that's silent on every connection must still fail, not hang.
+func TestOpenTelnetSessionDoesNotRetryForeverOnPersistentSilence(t *testing.T) {
+	host, port := startMockTelnetServer(t, mockTelnetServerOpts{
+		username:          "admin",
+		password:          "s3cret",
+		silentConnections: 1000, // effectively "always silent" for this test's duration
+	})
+
+	_, err := OpenTelnetSession(ConnectionParams{
+		Host:                host,
+		Port:                port,
+		Protocol:            "telnet",
+		Username:            "admin",
+		Password:            "s3cret",
+		ConnectTimeoutMs:    200,
+		PerCommandTimeoutMs: 200,
+	})
+	if err == nil {
+		t.Fatal("expected an error when the device is silent on every attempt, got nil")
 	}
 }
 

@@ -20,6 +20,15 @@ const (
 type OltCliError struct {
 	ErrType Type
 	Msg     string
+
+	// NoDataReceived is set by a timeout error when literally zero bytes
+	// arrived from the device before the timer fired -- distinct from a
+	// timeout where *some* output arrived but never matched what the
+	// caller was waiting for. Callers use this to decide whether a retry
+	// is worth attempting (see OpenTelnetSession): a connection that goes
+	// completely silent is a different failure mode than one that
+	// responds but not the way expected.
+	NoDataReceived bool
 }
 
 func New(t Type, msg string) *OltCliError {

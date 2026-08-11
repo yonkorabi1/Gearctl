@@ -143,15 +143,21 @@ func (p *telnetIacParser) replyToNegotiation(cmd, option byte) {
 		_, _ = p.conn.Write([]byte{iacByte, willByte, telOptTTYPE})
 		return
 	}
-	// Refuse everything else the same way as before -- WILL/DO expect a
-	// WONT/DONT-shaped refusal; WONT/DONT from the peer don't strictly
-	// need a reply, but echoing it back is a safe, idempotent no-op most
-	// servers ignore.
-	reply := byte(dontByte)
-	if cmd == doByte || cmd == willByte {
-		reply = wontByte
+	// Refuse everything else, using the RFC 854-correct pairing -- caught
+	// live against a real OLT (packet capture during Phase 1 testing):
+	// this used to reply WONT to a peer's WILL offer, which is backwards
+	// (WONT is a statement about OUR OWN behavior, the correct refusal of
+	// "I will do X" is "DONT", i.e. "don't do X"). The device tolerated
+	// the malformed reply here, but there's no reason to rely on that
+	// tolerance holding for every vendor. WONT/DONT from the peer are
+	// already negative acknowledgements -- replying to those risks an
+	// infinite negotiation loop with some peers, per RFC 854, so we don't.
+	switch cmd {
+	case willByte:
+		_, _ = p.conn.Write([]byte{iacByte, dontByte, option})
+	case doByte:
+		_, _ = p.conn.Write([]byte{iacByte, wontByte, option})
 	}
-	_, _ = p.conn.Write([]byte{iacByte, reply, option})
 }
 
 func (p *telnetIacParser) replyToSubnegotiation(option byte, payload []byte) {
@@ -204,7 +210,34 @@ const diagnosticSnippetMax = 500
 // either own the whole prompt-matching loop themselves in a way that
 // doesn't compose with the shared prompt-detection logic, or are thin/
 // unmaintained wrappers.
+//
+// Retries once, with an entirely fresh TCP connection, if the login
+// sequence times out having received literally zero bytes from the
+// device -- confirmed live via packet capture against a real OLT: its
+// first Telnet connection from a given source IP after a while goes
+// completely silent (most likely blocking on a reverse-DNS lookup of the
+// connecting address before it ever prints a banner), while a second,
+// near-immediate connection gets an instant response. This turns that
+// intermittent false failure into a transparent success for the operator
+// instead of requiring them to notice and click Run again. Does NOT retry
+// for any other failure (wrong credentials, a login sequence that got
+// partway through and then stalled, connection refused, etc.) -- only the
+// exact "connected, but the device never said a word" case.
 func OpenTelnetSession(params ConnectionParams) (ShellSession, error) {
+	session, err := openTelnetSessionAttempt(params)
+	if err == nil {
+		return session, nil
+	}
+
+	cliErr, ok := err.(*olterr.OltCliError)
+	if !ok || !cliErr.NoDataReceived {
+		return nil, err
+	}
+
+	return openTelnetSessionAttempt(params)
+}
+
+func openTelnetSessionAttempt(params ConnectionParams) (ShellSession, error) {
 	addr := net.JoinHostPort(params.Host, strconv.Itoa(params.Port))
 	conn, err := net.DialTimeout("tcp", addr, time.Duration(params.ConnectTimeoutMs)*time.Millisecond)
 	if err != nil {
@@ -320,17 +353,20 @@ func waitForSubstring(source *DataSource, patterns []*regexp.Regexp, timeout tim
 			// guessing. This is exactly the class of thing that only
 			// shows up against real hardware.
 			received := "(nothing received at all)"
-			if buffer.Len() > 0 {
+			noDataReceived := buffer.Len() == 0
+			if !noDataReceived {
 				snippet := buffer.String()
 				if len(snippet) > diagnosticSnippetMax {
 					snippet = snippet[:diagnosticSnippetMax]
 				}
 				received = fmt.Sprintf("%q", snippet)
 			}
-			return -1, olterr.New(
+			err := olterr.New(
 				olterr.TypeAuth,
 				"Timed out waiting for a login/password prompt. Device sent: "+received,
 			)
+			err.NoDataReceived = noDataReceived
+			return -1, err
 		}
 	}
 }

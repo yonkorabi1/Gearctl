@@ -2,9 +2,11 @@ package transport
 
 import (
 	"bufio"
+	"io"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // mockTelnetServerOpts configures a mockTelnetServer's behavior.
@@ -21,6 +23,14 @@ type mockTelnetServerOpts struct {
 	// refuses (WONT) every negotiation hangs forever against this server,
 	// exactly as the real OLT did.
 	requireTtypeNegotiation bool
+
+	// silentConnections reproduces the second real-hardware quirk found via
+	// packet capture: the first N connections accepted are held open but
+	// get NOTHING written to them at all (as if blocked on a slow reverse-
+	// DNS lookup that never resolves before the client gives up) --
+	// connections after that behave normally. Used to test
+	// OpenTelnetSession's retry-once-on-silence behavior.
+	silentConnections int32
 }
 
 // mockTelnetServer is an in-process, hand-rolled Telnet server (no
@@ -31,8 +41,9 @@ type mockTelnetServer struct {
 	listener net.Listener
 	opts     mockTelnetServerOpts
 
-	mu       sync.Mutex
-	stopping bool
+	mu              sync.Mutex
+	stopping        bool
+	connectionCount atomic.Int32
 }
 
 func newMockTelnetServer(opts mockTelnetServerOpts) (*mockTelnetServer, error) {
@@ -75,6 +86,16 @@ func (m *mockTelnetServer) stop() {
 
 func (m *mockTelnetServer) handleConn(conn net.Conn) {
 	defer conn.Close()
+
+	connNum := m.connectionCount.Add(1)
+	if connNum <= m.opts.silentConnections {
+		// Hold the connection open, write nothing at all, and just block
+		// reading until the peer gives up and closes it -- reproduces the
+		// exact "connected but the device never said a word" pattern seen
+		// live against a real OLT.
+		_, _ = io.Copy(io.Discard, conn)
+		return
+	}
 
 	if m.opts.requireTtypeNegotiation {
 		// IAC DO TTYPE, then immediately ask the client to SEND its
