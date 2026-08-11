@@ -54,9 +54,11 @@ func (s *StreamShellSession) Open(params ConnectionParams) error {
 	// Junos-lineage CLIs have no such concept, and Junos's normal prompt
 	// also ends in ">" -- see enablevendors.go for why this is an explicit
 	// vendor allowlist, not a prompt-shape guess) -- gated on vendor first,
-	// the ">" suffix second, and only attempted at all if an enable
-	// password was actually configured.
-	if params.EnablePassword != "" && isEnableStyleVendor(params.Vendor) && strings.HasSuffix(s.promptText, ">") {
+	// the ">" suffix second. Deliberately NOT also gated on having an
+	// enable password configured: confirmed live that some devices accept
+	// "enable" with no password at all (see attemptEnable -- it only
+	// needs one if the device actually asks for one).
+	if isEnableStyleVendor(params.Vendor) && strings.HasSuffix(s.promptText, ">") {
 		nextPrompt, err := attemptEnable(
 			s.source,
 			s.promptText,
@@ -106,14 +108,28 @@ func (s *StreamShellSession) SendAndWaitForPrompt(command string, timeout time.D
 	return output, false, nil
 }
 
-// attemptEnable sends the literal command "enable" and, only if the
-// device responds with something password-shaped, answers with
-// enablePassword and returns the resulting (re-derived) prompt. If the
-// device doesn't ask for a password at all -- unrecognized command,
-// already privileged, whatever the reason -- this is a no-op and the
-// original prompt is returned unchanged. Callers are expected to have
-// already decided this is worth trying (vendor allowlist + prompt shape,
-// see Open()); this function itself has no vendor knowledge.
+// attemptEnable sends the literal command "enable" and inspects what
+// comes back:
+//
+//   - Something password-shaped, AND an enable password is configured ->
+//     answer it, then settle on whatever prompt follows (same logic as
+//     the initial post-login prompt capture).
+//   - Something password-shaped, but NO enable password is configured ->
+//     a real, surfaced error. Confirmed live that not every enable-style
+//     vendor requires a password at all, so this is attempted
+//     unconditionally (see Open()) -- but if THIS device does demand one
+//     and we have nothing to give it, the session is now stuck sitting
+//     at an unanswered prompt. Continuing anyway would just make every
+//     subsequent command fail with a confusing timeout instead.
+//   - Anything else -- unrecognized command, or "enable" already
+//     succeeded with no password step at all -- a no-op. The resulting
+//     prompt is used either way: if the device really did escalate
+//     silently (no password needed), its prompt may already have
+//     changed, and callers need to track that.
+//
+// Callers are expected to have already decided this is worth trying
+// (vendor allowlist + prompt shape, see Open()); this function itself has
+// no vendor knowledge.
 func attemptEnable(source *DataSource, promptText, enablePassword string, timeout time.Duration) (string, error) {
 	_, candidatePrompt, err := waitForPrompt(source, "enable", promptText, timeout)
 	if err != nil {
@@ -124,18 +140,17 @@ func attemptEnable(source *DataSource, promptText, enablePassword string, timeou
 		return "", err
 	}
 	if !passwordPattern.MatchString(candidatePrompt) {
-		// Whatever came back doesn't look like a password prompt -- no
-		// enable concept here after all, or already privileged. Keep
-		// going with the prompt as re-derived (harmless either way: if
-		// "enable" was rejected outright, the original prompt reappears
-		// unchanged and this is a pure no-op).
 		return candidatePrompt, nil
+	}
+	if enablePassword == "" {
+		return "", olterr.New(
+			olterr.TypeAuth,
+			`Device asked for a password after "enable", but no enable password is configured for this OLT`,
+		)
 	}
 	if err := source.Write(enablePassword + crlf); err != nil {
 		return "", olterr.New(olterr.TypeConnection, "failed to write enable password: "+err.Error())
 	}
-	// The credential's been sent; just settle on whatever prompt follows,
-	// the same way the initial post-login prompt was captured.
 	return capturePrompt(source, int(timeout/time.Millisecond))
 }
 

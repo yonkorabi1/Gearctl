@@ -13,7 +13,7 @@ func TestIsEnableStyleVendor(t *testing.T) {
 		{"huawei", false},
 		{"juniper", false},
 		{"junos", false},
-		{"HSGQ", false}, // OLT-WRK-LTP-01's vendor tag -- not confirmed to need enable
+		{"HSGQ", true}, // OLT-WRK-LTP-01's vendor tag -- confirmed live to need enable
 		{"", false},
 		{"unknown-vendor", false},
 	}

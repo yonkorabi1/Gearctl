@@ -24,6 +24,15 @@ import "strings"
 var enableStyleVendors = map[string]bool{
 	"cisco":  true,
 	"arista": true,
+	// Confirmed live against OLT-WRK-LTP-01: its CLI reports errors as
+	// "vty% [VTY] vty[node:N],Unknown command: ..." -- the Quagga/FRRouting
+	// VTY shell's exact error format, which has Cisco-style privilege
+	// nodes. "config"/"configure" is genuinely unrecognized at the
+	// unprivileged node and only becomes valid after "enable" -- and on
+	// this device, "enable" succeeded with no password prompt at all
+	// (see attemptEnable for why that's handled as a distinct case from
+	// "vendor doesn't have this concept").
+	"hsgq": true,
 }
 
 // isEnableStyleVendor reports whether vendor (the free-text hint carried

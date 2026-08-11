@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/onu-platform/olt-cli-gateway/internal/olterr"
 )
 
 // TestStreamShellSessionTracksPromptAcrossModeChange is the end-to-end
@@ -197,17 +199,27 @@ func TestStreamShellSessionSkipsEnableWhenAlreadyPrivileged(t *testing.T) {
 	}
 }
 
-// TestStreamShellSessionSkipsEnableWithoutEnablePassword confirms no
-// attempt is made at all when no enable password was configured, even for
-// an allowlisted vendor with an unprivileged-looking prompt.
-func TestStreamShellSessionSkipsEnableWithoutEnablePassword(t *testing.T) {
+// TestStreamShellSessionAttemptsEnableWithoutPasswordConfigured confirms
+// "enable" IS attempted even when no enable password is configured --
+// confirmed live against OLT-WRK-LTP-01: this device accepted "enable"
+// with no password step at all, so requiring a configured password as a
+// precondition would have skipped escalation entirely on exactly the
+// device that needed it.
+func TestStreamShellSessionAttemptsEnableWithoutPasswordConfigured(t *testing.T) {
 	var sent []string
 	source := newScriptedSource(func(written string, chunks chan<- []byte) {
 		sent = append(sent, written)
-		if written == crlf {
+		switch written {
+		case crlf:
 			go func() {
 				time.Sleep(10 * time.Millisecond)
 				chunks <- []byte("\r\n\r\nrouter>")
+			}()
+		case "enable" + crlf:
+			// Succeeds immediately -- no password prompt at all.
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("enable\r\nrouter>")
 			}()
 		}
 	})
@@ -215,16 +227,57 @@ func TestStreamShellSessionSkipsEnableWithoutEnablePassword(t *testing.T) {
 	session := NewStreamShellSession(source, func() error { return nil })
 	err := session.Open(ConnectionParams{
 		ConnectTimeoutMs: 500,
-		Vendor:           "cisco",
+		Vendor:           "hsgq",
+		// No EnablePassword set.
 	})
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
 
+	foundEnable := false
 	for _, w := range sent {
-		if strings.HasPrefix(w, "enable") {
-			t.Fatalf("did not expect \"enable\" to be sent without an enable password configured, but got write %q", w)
+		if w == "enable"+crlf {
+			foundEnable = true
 		}
+	}
+	if !foundEnable {
+		t.Fatal("expected \"enable\" to be sent even without a configured enable password")
+	}
+}
+
+// TestStreamShellSessionEnableFailsWhenPasswordNeededButNotConfigured
+// confirms a clear, surfaced error -- not a session silently left stuck
+// at an unanswered password prompt, which would make every subsequent
+// command fail with a confusing timeout instead -- when the device DOES
+// ask for a password after "enable" but none was configured.
+func TestStreamShellSessionEnableFailsWhenPasswordNeededButNotConfigured(t *testing.T) {
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		switch written {
+		case crlf:
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("\r\n\r\nrouter>")
+			}()
+		case "enable" + crlf:
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("enable\r\nPassword: ")
+			}()
+		}
+	})
+
+	session := NewStreamShellSession(source, func() error { return nil })
+	err := session.Open(ConnectionParams{
+		ConnectTimeoutMs: 4000, // headroom over commandQuiescenceMs, see the "known vendor" test above
+		Vendor:           "cisco",
+		// No EnablePassword set.
+	})
+	if err == nil {
+		t.Fatal("expected an error when the device asks for a password we don't have")
+	}
+	cliErr, ok := err.(*olterr.OltCliError)
+	if !ok || cliErr.ErrType != olterr.TypeAuth {
+		t.Fatalf("got error %v, want an auth-typed OltCliError", err)
 	}
 }
 
