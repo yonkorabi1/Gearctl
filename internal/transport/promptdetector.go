@@ -9,6 +9,15 @@ import (
 
 const defaultQuiescenceMs = 300
 
+// commandQuiescenceMs is deliberately longer than defaultQuiescenceMs
+// (used only for the initial, output-free prompt capture) -- see
+// waitForPrompt's doc comment for why: it's the fallback used when a
+// command's output never contains the previously-known prompt at all, and
+// a real command's output can legitimately have brief pauses mid-stream
+// (e.g. a "show" enumerating many ONUs) that would otherwise look like
+// premature quiescence.
+const commandQuiescenceMs = 2000
+
 // crlf is the NVT (Network Virtual Terminal) line ending per RFC 854 --
 // Telnet defines a line ending as CR LF, not a bare LF. Confirmed live
 // against a real OLT (packet capture + a manual telnet session that DID
@@ -63,14 +72,7 @@ func capturePrompt(source *DataSource, maxWaitMs int) (string, error) {
 	}
 	settled := waitForQuiescence(source, defaultQuiescenceMs*time.Millisecond, time.Duration(maxWaitMs)*time.Millisecond)
 
-	lines := strings.Split(strings.ReplaceAll(settled, "\r\n", "\n"), "\n")
-	prompt := ""
-	for _, l := range lines {
-		trimmed := strings.TrimSpace(l)
-		if trimmed != "" {
-			prompt = trimmed
-		}
-	}
+	prompt := lastNonEmptyLine(settled)
 	if prompt == "" {
 		return "", olterr.New(
 			olterr.TypeProtocol,
@@ -80,33 +82,87 @@ func capturePrompt(source *DataSource, maxWaitMs int) (string, error) {
 	return prompt, nil
 }
 
+// lastNonEmptyLine returns the last non-blank line of text, trimmed of
+// surrounding whitespace only -- deliberately NOT regex-escaped/
+// interpreted; matching elsewhere in this file is a plain substring check.
+func lastNonEmptyLine(text string) string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	last := ""
+	for _, l := range lines {
+		if trimmed := strings.TrimSpace(l); trimmed != "" {
+			last = trimmed
+		}
+	}
+	return last
+}
+
 // waitForPrompt sends `command`, then accumulates output until the buffer's
-// tail contains `promptText` (the previously captured prompt) or timeout
-// elapses. On success, returns the output with the leading echoed command
-// line and the trailing prompt occurrence stripped. On timeout, returns an
-// olterr.OltCliError with Type "timeout" -- the caller MUST treat the
-// session as unusable afterward (see ShellSession's contract).
-func waitForPrompt(source *DataSource, command, promptText string, timeout time.Duration) (string, error) {
+// tail contains `promptText` (the previously captured prompt), or the
+// output goes quiet for commandQuiescenceMs without ever matching it, or
+// the overall timeout elapses. On success, returns the output (leading
+// echoed command line and trailing prompt occurrence stripped) plus the
+// prompt to use for the NEXT command -- normally just promptText again,
+// but re-derived from the settled output's own trailing line when the
+// quiescence fallback fired instead of a substring match.
+//
+// The fallback matters because this driver has no vendor knowledge of
+// privilege/mode levels: confirmed live against a real OLT, entering
+// config mode changes the prompt itself (e.g. "OLT>" -> "OLT(config)#"),
+// so the previously-captured prompt never reappears and a pure substring
+// match would time out on every mode-changing command even though the
+// device responded fine. Deliberately a much longer quiescence window
+// than the initial connect-time prompt capture (commandQuiescenceMs vs.
+// defaultQuiescenceMs) -- a real command's output can have brief pauses
+// mid-stream (e.g. a "show" enumerating many ONUs) that would otherwise
+// look like premature completion.
+//
+// On timeout, returns an olterr.OltCliError with Type "timeout" -- the
+// caller MUST treat the session as unusable afterward (see ShellSession's
+// contract).
+func waitForPrompt(source *DataSource, command, promptText string, timeout time.Duration) (output string, nextPrompt string, err error) {
 	if err := source.Write(command + crlf); err != nil {
-		return "", olterr.New(olterr.TypeConnection, "failed to write to session: "+err.Error())
+		return "", "", olterr.New(olterr.TypeConnection, "failed to write to session: "+err.Error())
 	}
 
 	var buffer strings.Builder
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+	quietTimer := time.NewTimer(commandQuiescenceMs * time.Millisecond)
+	defer quietTimer.Stop()
 
 	for {
 		select {
 		case chunk, ok := <-source.Chunks:
 			if !ok {
-				return "", olterr.New(olterr.TypeProtocol, "session closed while waiting for prompt after \""+command+"\"")
+				return "", "", olterr.New(olterr.TypeProtocol, "session closed while waiting for prompt after \""+command+"\"")
 			}
 			buffer.Write(chunk)
 			if strings.Contains(buffer.String(), promptText) {
-				return stripEchoAndPrompt(buffer.String(), command, promptText), nil
+				return stripEchoAndPrompt(buffer.String(), command, promptText), promptText, nil
 			}
+			if !quietTimer.Stop() {
+				select {
+				case <-quietTimer.C:
+				default:
+				}
+			}
+			quietTimer.Reset(commandQuiescenceMs * time.Millisecond)
+		case <-quietTimer.C:
+			settled := buffer.String()
+			if settled == "" {
+				// Nothing at all has arrived yet -- not truly quiet, the
+				// device just hasn't started responding. Keep waiting for
+				// the real timeout rather than finishing early on nothing.
+				quietTimer.Reset(commandQuiescenceMs * time.Millisecond)
+				continue
+			}
+			newPrompt := lastNonEmptyLine(settled)
+			if newPrompt == "" {
+				newPrompt = promptText
+			}
+			return stripEchoAndPrompt(settled, command, newPrompt), newPrompt, nil
 		case <-timer.C:
-			return "", olterr.New(olterr.TypeTimeout, "Timed out waiting for prompt after \""+command+"\"")
+			return "", "", olterr.New(olterr.TypeTimeout, "Timed out waiting for prompt after \""+command+"\"")
 		}
 	}
 }

@@ -66,12 +66,74 @@ func TestWaitForPromptSuccess(t *testing.T) {
 		}()
 	})
 
-	output, err := waitForPrompt(source, "show version", "OLT#", 2*time.Second)
+	output, nextPrompt, err := waitForPrompt(source, "show version", "OLT#", 2*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if output != "output here" {
 		t.Fatalf("got output %q, want %q", output, "output here")
+	}
+	if nextPrompt != "OLT#" {
+		t.Fatalf("got nextPrompt %q, want %q (unchanged on a substring match)", nextPrompt, "OLT#")
+	}
+}
+
+// TestWaitForPromptDetectsChangedPrompt is the regression test for a
+// real-hardware finding: a command that changes the prompt itself (e.g.
+// entering config mode, "OLT>" -> "OLT(config)#") never makes the OLD
+// prompt reappear, so a pure substring match would time out even though
+// the device responded fine. waitForPrompt must fall back to a settled-
+// output heuristic and report the new prompt for the next call to use.
+func TestWaitForPromptDetectsChangedPrompt(t *testing.T) {
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		if !strings.Contains(written, "config") {
+			return
+		}
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			chunks <- []byte("config\r\nEntering configuration mode\r\nOLT(config)#")
+		}()
+	})
+
+	output, nextPrompt, err := waitForPrompt(source, "config", "OLT>", 3*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if output != "Entering configuration mode" {
+		t.Fatalf("got output %q, want %q", output, "Entering configuration mode")
+	}
+	if nextPrompt != "OLT(config)#" {
+		t.Fatalf("got nextPrompt %q, want %q", nextPrompt, "OLT(config)#")
+	}
+}
+
+// TestWaitForPromptFallbackWaitsForOutputToStart confirms the quiescence
+// fallback doesn't fire on a device that simply hasn't started responding
+// yet (buffer still empty) -- only on output that arrived and then went
+// quiet without matching.
+func TestWaitForPromptFallbackWaitsForOutputToStart(t *testing.T) {
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		if !strings.Contains(written, "slow") {
+			return
+		}
+		go func() {
+			// Longer than commandQuiescenceMs -- if the fallback
+			// incorrectly fired on an empty buffer, this test would see a
+			// bogus early success instead of the real output below.
+			time.Sleep(commandQuiescenceMs*time.Millisecond + 200*time.Millisecond)
+			chunks <- []byte("slow\r\nfinally here\r\nOLT#")
+		}()
+	})
+
+	output, nextPrompt, err := waitForPrompt(source, "slow", "OLT#", 5*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if output != "finally here" {
+		t.Fatalf("got output %q, want %q", output, "finally here")
+	}
+	if nextPrompt != "OLT#" {
+		t.Fatalf("got nextPrompt %q, want %q", nextPrompt, "OLT#")
 	}
 }
 
@@ -80,7 +142,7 @@ func TestWaitForPromptTimeout(t *testing.T) {
 		// The device never sends the prompt back.
 	})
 
-	_, err := waitForPrompt(source, "show version", "OLT#", 50*time.Millisecond)
+	_, _, err := waitForPrompt(source, "show version", "OLT#", 50*time.Millisecond)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -100,7 +162,7 @@ func TestWaitForPromptSessionClosed(t *testing.T) {
 		},
 	}
 
-	_, err := waitForPrompt(source, "show version", "OLT#", 2*time.Second)
+	_, _, err := waitForPrompt(source, "show version", "OLT#", 2*time.Second)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}

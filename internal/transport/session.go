@@ -53,7 +53,7 @@ func (s *StreamShellSession) Open(params ConnectionParams) error {
 		// Discard output -- this command's only purpose is to stop the
 		// device from blocking on a "--More--" style pager, not to report
 		// anything back to the caller.
-		_, err := waitForPrompt(
+		_, nextPrompt, err := waitForPrompt(
 			s.source,
 			params.DisablePagingCommand,
 			s.promptText,
@@ -62,6 +62,7 @@ func (s *StreamShellSession) Open(params ConnectionParams) error {
 		if err != nil {
 			return err
 		}
+		s.promptText = nextPrompt
 	}
 	return nil
 }
@@ -70,10 +71,15 @@ func (s *StreamShellSession) SendAndWaitForPrompt(command string, timeout time.D
 	if s.closed {
 		return "", false, olterr.New(olterr.TypeProtocol, "Cannot send a command on a closed session")
 	}
-	output, err := waitForPrompt(s.source, command, s.promptText, timeout)
+	output, nextPrompt, err := waitForPrompt(s.source, command, s.promptText, timeout)
 	if err != nil {
 		return "", false, err
 	}
+	// Re-derived every call, not just assumed unchanged -- see
+	// waitForPrompt's doc comment: a command can change the prompt itself
+	// (e.g. entering a config/privileged mode), and the next command needs
+	// to match against whatever the prompt actually is NOW.
+	s.promptText = nextPrompt
 	if len(output) > MaxOutputBytes {
 		return truncateUTF8(output, MaxOutputBytes), true, nil
 	}
