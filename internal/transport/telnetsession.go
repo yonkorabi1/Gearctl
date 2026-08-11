@@ -23,11 +23,24 @@ const (
 	telOptTTYPE = 24
 	ttypeIS     = 0
 	ttypeSEND   = 1
+
+	telOptNAWS = 31
 )
 
 // terminalType is the generic terminal type advertised in response to a
 // TTYPE SEND request -- see telnetIacParser's doc comment.
 const terminalType = "VT100"
+
+// Fixed window dimensions advertised for NAWS -- this is a headless,
+// non-interactive client with no real terminal, but some embedded telnetd
+// implementations block waiting for real dimensions rather than accepting
+// a refusal gracefully (see telnetIacParser's doc comment, point 3). Any
+// plausible fixed size unblocks them; the exact numbers don't matter since
+// nothing here actually does column-aware rendering.
+const (
+	nawsWidth  = 80
+	nawsHeight = 24
+)
 
 // telnetIacParser is a stateful IAC (Telnet protocol command) parser. It
 // strips option-negotiation traffic from the incoming byte stream and
@@ -53,9 +66,19 @@ const terminalType = "VT100"
 //     and then went silent, never showing a login prompt, because
 //     refusing TTYPE outright left it stuck waiting. This parser instead
 //     agrees to TTYPE (`IAC WILL TTYPE`) and answers a SEND request with a
-//     generic terminal type (`IAC SB TTYPE IS "VT100" IAC SE`) --
-//     everything else is still refused via WONT/DONT, matching a minimal,
-//     safe terminal.
+//     generic terminal type (`IAC SB TTYPE IS "VT100" IAC SE`).
+//  3. Same problem, different option: confirmed live, via packet capture,
+//     against the same real OLT -- it also sends `IAC DO NAWS` (window
+//     size) up front, and refusing it (the previous behavior) is enough
+//     to make the device go silent again *after* login, never printing a
+//     password prompt, even though TTYPE negotiation completed correctly.
+//     A real telnet client always answers NAWS with actual window
+//     dimensions, which this minimal client has none of -- so it agrees
+//     (`IAC WILL NAWS`) and reports a fixed, plausible size instead of
+//     refusing outright.
+//
+// Everything else is still refused via WONT/DONT, matching a minimal,
+// safe terminal.
 type telnetIacParser struct {
 	pending []byte
 	conn    net.Conn
@@ -141,6 +164,20 @@ func (p *telnetIacParser) replyToNegotiation(cmd, option byte) {
 		// -- see the type's doc comment for why this matters for real
 		// hardware.
 		_, _ = p.conn.Write([]byte{iacByte, willByte, telOptTTYPE})
+		return
+	}
+	if option == telOptNAWS && cmd == doByte {
+		// Agree to report window size, then immediately report it --
+		// unlike TTYPE, NAWS has no SEND subcommand; the client just sends
+		// its dimensions proactively once it agrees. See the type's doc
+		// comment (point 3) for why refusing this outright isn't safe.
+		_, _ = p.conn.Write([]byte{iacByte, willByte, telOptNAWS})
+		_, _ = p.conn.Write([]byte{
+			iacByte, sbByte, telOptNAWS,
+			0, nawsWidth,
+			0, nawsHeight,
+			iacByte, seByte,
+		})
 		return
 	}
 	// Refuse everything else, using the RFC 854-correct pairing -- caught

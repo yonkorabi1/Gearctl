@@ -211,6 +211,44 @@ func TestOpenTelnetSessionSurvivesTtypeNegotiation(t *testing.T) {
 	}
 }
 
+// TestOpenTelnetSessionSurvivesNawsNegotiation is the regression test for
+// the third real-hardware bug: a device that withholds its password prompt
+// (even after TTYPE negotiates fine) until it gets a real NAWS window-size
+// answer must still succeed against this client, not hang until
+// perCommandTimeoutMs expires waiting for a password prompt that never
+// comes.
+func TestOpenTelnetSessionSurvivesNawsNegotiation(t *testing.T) {
+	host, port := startMockTelnetServer(t, mockTelnetServerOpts{
+		username:                "admin",
+		password:                "s3cret",
+		responses:               map[string]string{"show version": "OLT-Gateway-Mock v1.0"},
+		requireTtypeNegotiation: true,
+		requireNawsNegotiation:  true,
+	})
+
+	session, err := OpenTelnetSession(ConnectionParams{
+		Host:                host,
+		Port:                port,
+		Protocol:            "telnet",
+		Username:            "admin",
+		Password:            "s3cret",
+		ConnectTimeoutMs:    2000,
+		PerCommandTimeoutMs: 2000,
+	})
+	if err != nil {
+		t.Fatalf("OpenTelnetSession failed against a NAWS-requiring server: %v", err)
+	}
+	defer session.Close()
+
+	output, _, err := session.SendAndWaitForPrompt("show version", 2*time.Second)
+	if err != nil {
+		t.Fatalf("SendAndWaitForPrompt failed: %v", err)
+	}
+	if output != "OLT-Gateway-Mock v1.0" {
+		t.Errorf("got output %q, want %q", output, "OLT-Gateway-Mock v1.0")
+	}
+}
+
 // TestOpenTelnetSessionRetriesOnceOnSilentConnection is the regression
 // test for the second real-hardware finding (via packet capture): a first
 // Telnet connection that goes completely silent shouldn't surface as a

@@ -24,6 +24,14 @@ type mockTelnetServerOpts struct {
 	// exactly as the real OLT did.
 	requireTtypeNegotiation bool
 
+	// requireNawsNegotiation reproduces a real-hardware bug found via
+	// packet capture: the server sends IAC DO NAWS up front (alongside DO
+	// TTYPE) and, even after TTYPE negotiates correctly, never shows the
+	// password prompt unless it also gets a real IAC SB NAWS <w> <h> IAC SE
+	// reply -- a client that refuses NAWS outright (the previous behavior)
+	// gets stuck exactly like the real OLT did.
+	requireNawsNegotiation bool
+
 	// silentConnections reproduces the second real-hardware quirk found via
 	// packet capture: the first N connections accepted are held open but
 	// get NOTHING written to them at all (as if blocked on a slow reverse-
@@ -97,6 +105,24 @@ func (m *mockTelnetServer) handleConn(conn net.Conn) {
 		return
 	}
 
+	// One shared reader for the whole connection -- critical for
+	// requireTtypeNegotiation and requireNawsNegotiation to compose
+	// correctly. The client answers negotiation the moment it sees the
+	// bytes, well before "login: " is even written, so if each check read
+	// from its own separate reader (or straight off conn), whichever ran
+	// first would silently consume bytes the other one still needed,
+	// making it hang forever waiting for a reply that already came and
+	// went. A single reader ensures nothing gets consumed twice or lost.
+	reader := bufio.NewReader(conn)
+
+	if m.opts.requireNawsNegotiation {
+		// Sent up front, same as the real OLT capture -- alongside DO
+		// TTYPE, before the login prompt.
+		if _, err := conn.Write([]byte{iacByte, doByte, telOptNAWS}); err != nil {
+			return
+		}
+	}
+
 	if m.opts.requireTtypeNegotiation {
 		// IAC DO TTYPE, then immediately ask the client to SEND its
 		// terminal type via subnegotiation -- matches the real OLT's
@@ -108,7 +134,16 @@ func (m *mockTelnetServer) handleConn(conn net.Conn) {
 		if _, err := conn.Write([]byte{iacByte, sbByte, telOptTTYPE, ttypeSEND, iacByte, seByte}); err != nil {
 			return
 		}
-		if !m.waitForTtypeIsReply(conn) {
+	}
+
+	if m.opts.requireNawsNegotiation {
+		if !m.waitForNawsReply(reader) {
+			return // client never answered -- stay silent forever, like the real bug.
+		}
+	}
+
+	if m.opts.requireTtypeNegotiation {
+		if !m.waitForTtypeIsReply(reader) {
 			return // client never answered -- stay silent forever, like the real bug.
 		}
 	}
@@ -116,7 +151,7 @@ func (m *mockTelnetServer) handleConn(conn net.Conn) {
 	if _, err := conn.Write([]byte("login: ")); err != nil {
 		return
 	}
-	reader := bufio.NewReader(conn)
+
 	username, err := readLine(reader)
 	if err != nil || username != m.opts.username {
 		return
@@ -150,47 +185,72 @@ func (m *mockTelnetServer) handleConn(conn net.Conn) {
 	}
 }
 
-// waitForTtypeIsReply reads raw bytes off the connection until it sees a
-// complete IAC SB TTYPE IS ... IAC SE subnegotiation reply. Deliberately
-// does NOT use telnetIacParser here -- this is the server side, standing
-// in for a real device, and must stay independent of the client code
-// under test.
-func (m *mockTelnetServer) waitForTtypeIsReply(conn net.Conn) bool {
-	needle := []byte{iacByte, sbByte, telOptTTYPE, ttypeIS}
-	var seen []byte
-	buf := make([]byte, 256)
+// waitForTtypeIsReply scans (byte-by-byte, via the connection's one
+// shared bufio.Reader -- see handleConn's comment on why sharing it
+// matters) for a complete IAC SB TTYPE IS <name...> IAC SE reply.
+// Deliberately does NOT use telnetIacParser here -- this is the server
+// side, standing in for a real device, and must stay independent of the
+// client code under test.
+func (m *mockTelnetServer) waitForTtypeIsReply(reader *bufio.Reader) bool {
+	if !scanForNeedle(reader, []byte{iacByte, sbByte, telOptTTYPE, ttypeIS}) {
+		return false
+	}
+	// Consume the variable-length terminal-type name up to the closing
+	// IAC SE (unlike NAWS, TTYPE's payload has no fixed length).
 	for {
-		n, err := conn.Read(buf)
-		if n > 0 {
-			seen = append(seen, buf[:n]...)
-			if idx := indexOf(seen, needle); idx != -1 {
-				// Also require the closing IAC SE somewhere after it.
-				tail := seen[idx+len(needle):]
-				if indexOf(tail, []byte{iacByte, seByte}) != -1 {
-					return true
-				}
-			}
-		}
+		b, err := reader.ReadByte()
 		if err != nil {
 			return false
 		}
+		if b != iacByte {
+			continue
+		}
+		b2, err := reader.ReadByte()
+		if err != nil {
+			return false
+		}
+		return b2 == seByte
 	}
 }
 
-func indexOf(haystack, needle []byte) int {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		match := true
-		for j := range needle {
-			if haystack[i+j] != needle[j] {
-				match = false
-				break
-			}
+// waitForNawsReply scans for a complete IAC SB NAWS <w-hi> <w-lo> <h-hi>
+// <h-lo> IAC SE reply.
+func (m *mockTelnetServer) waitForNawsReply(reader *bufio.Reader) bool {
+	if !scanForNeedle(reader, []byte{iacByte, sbByte, telOptNAWS}) {
+		return false
+	}
+	rest := make([]byte, 6) // width(2) + height(2) + IAC SE(2)
+	if _, err := io.ReadFull(reader, rest); err != nil {
+		return false
+	}
+	return rest[4] == iacByte && rest[5] == seByte
+}
+
+// scanForNeedle consumes bytes from reader one at a time until it has read
+// exactly through a full occurrence of needle, or the connection ends.
+// Bytes read but not part of a (possibly abandoned) partial match are
+// discarded -- fine here since these mock-server helpers only ever look
+// for negotiation replies, never plain text that might matter later.
+func scanForNeedle(reader *bufio.Reader, needle []byte) bool {
+	matched := 0
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return false
 		}
-		if match {
-			return i
+		if b == needle[matched] {
+			matched++
+			if matched == len(needle) {
+				return true
+			}
+			continue
+		}
+		if b == needle[0] {
+			matched = 1
+		} else {
+			matched = 0
 		}
 	}
-	return -1
 }
 
 func readLine(reader *bufio.Reader) (string, error) {
