@@ -91,7 +91,7 @@ func capturePrompt(source *DataSource, maxWaitMs int) (string, error) {
 	}
 	settled := waitForQuiescence(source, defaultQuiescenceMs*time.Millisecond, time.Duration(maxWaitMs)*time.Millisecond)
 
-	prompt := lastNonEmptyLine(settled)
+	prompt := lastPromptLikeLine(settled)
 	if prompt == "" {
 		return "", olterr.New(
 			olterr.TypeProtocol,
@@ -113,6 +113,44 @@ func lastNonEmptyLine(text string) string {
 		}
 	}
 	return last
+}
+
+// asyncLogLinePattern matches unsolicited system/log messages some devices
+// push to the console asynchronously -- confirmed live against a real OLT
+// (OLT-WRK-LTP-01): it sends lines like "[1970/01/31 13:23:36]
+// [system]Warning: Login locally, please check the AAA settings" some time
+// AFTER the real shell prompt already appeared, landing in the same
+// quiescence window a naive "last non-blank line is the prompt" heuristic
+// relies on -- so the warning got captured as "the prompt" instead of the
+// real one, silently breaking everything downstream that depends on it
+// (enable-escalation's ">"-suffix check, command completion matching).
+// Bracketed-timestamp-prefixed console messages are a common convention
+// well beyond this one vendor, so filtering them out when hunting for the
+// real prompt is generically useful hardening, not a vendor-specific hack.
+var asyncLogLinePattern = regexp.MustCompile(`^\[[^\]]*\]`)
+
+// lastPromptLikeLine returns the last non-blank line of text that doesn't
+// look like an unsolicited async log message (see asyncLogLinePattern).
+// Falls back to the literal last non-blank line if every line looks like
+// noise -- better to guess wrong than return nothing at all.
+func lastPromptLikeLine(text string) string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	lastAny := ""
+	lastPromptLike := ""
+	for _, l := range lines {
+		trimmed := strings.TrimSpace(l)
+		if trimmed == "" {
+			continue
+		}
+		lastAny = trimmed
+		if !asyncLogLinePattern.MatchString(trimmed) {
+			lastPromptLike = trimmed
+		}
+	}
+	if lastPromptLike != "" {
+		return lastPromptLike
+	}
+	return lastAny
 }
 
 // waitForPrompt sends `command`, then accumulates output until the buffer's
@@ -195,7 +233,7 @@ func waitForPrompt(source *DataSource, command, promptText string, timeout time.
 				quietTimer.Reset(commandQuiescenceMs * time.Millisecond)
 				continue
 			}
-			newPrompt := lastNonEmptyLine(settled)
+			newPrompt := lastPromptLikeLine(settled)
 			if newPrompt == "" {
 				newPrompt = promptText
 			}

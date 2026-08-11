@@ -62,6 +62,56 @@ func TestStreamShellSessionTracksPromptAcrossModeChange(t *testing.T) {
 	}
 }
 
+// TestStreamShellSessionEnableSurvivesAsyncLogNoise is the end-to-end
+// regression test for the real-hardware finding: OLT-WRK-LTP-01 pushes an
+// unsolicited, bracketed-timestamp log line to the console right after
+// the real prompt appears. Before lastPromptLikeLine existed, this got
+// captured as "the prompt" instead of "KRITIPUR-OLT>" -- which doesn't
+// end in ">", so the enable-escalation gate silently skipped the attempt
+// even though the vendor was correctly allowlisted.
+func TestStreamShellSessionEnableSurvivesAsyncLogNoise(t *testing.T) {
+	var sent []string
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		sent = append(sent, written)
+		switch written {
+		case crlf:
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("\r\n\r\nKRITIPUR-OLT>\r\n[1970/01/31 13:23:36]  [system]Warning: Login locally, please check the AAA settings")
+			}()
+		case "enable" + crlf:
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("enable\r\nKRITIPUR-OLT#")
+			}()
+		}
+	})
+
+	session := NewStreamShellSession(source, func() error { return nil })
+	err := session.Open(ConnectionParams{
+		// Comfortably longer than commandQuiescenceMs (2s) -- "enable"'s
+		// response here doesn't contain the old ">"-suffixed prompt (it
+		// changed to "#"), so detecting it relies on the quiescence
+		// fallback, which needs headroom under the hard timeout to win
+		// that race.
+		ConnectTimeoutMs: 4000,
+		Vendor:           "hsgq",
+	})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	foundEnable := false
+	for _, w := range sent {
+		if w == "enable"+crlf {
+			foundEnable = true
+		}
+	}
+	if !foundEnable {
+		t.Fatal("expected \"enable\" to be sent despite the trailing async log noise")
+	}
+}
+
 // TestStreamShellSessionAttemptsEnableForKnownVendor confirms the full
 // escalation path for a vendor known to use it: unprivileged prompt +
 // enable password configured + an allowlisted vendor -> "enable" gets

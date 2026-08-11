@@ -40,6 +40,72 @@ func TestCapturePromptSuccess(t *testing.T) {
 	}
 }
 
+// TestCapturePromptIgnoresTrailingAsyncLogMessage is the regression test
+// for a real-hardware finding: a device pushed an unsolicited, bracketed-
+// timestamp system warning to the console AFTER the real prompt already
+// appeared, landing in the same quiescence window. A naive "last non-
+// blank line is the prompt" heuristic captured the warning instead of the
+// real "KRITIPUR-OLT>" prompt, silently breaking every downstream
+// decision that depends on the captured prompt (the ">"-suffix check for
+// enable-escalation, command completion matching).
+func TestCapturePromptIgnoresTrailingAsyncLogMessage(t *testing.T) {
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			chunks <- []byte("\r\n\r\nKRITIPUR-OLT>\r\n[1970/01/31 13:23:36]  [system]Warning: Login locally, please check the AAA settings")
+		}()
+	})
+
+	prompt, err := capturePrompt(source, 2000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if prompt != "KRITIPUR-OLT>" {
+		t.Fatalf("got prompt %q, want %q (the async warning line should be ignored)", prompt, "KRITIPUR-OLT>")
+	}
+}
+
+func TestLastPromptLikeLine(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want string
+	}{
+		{
+			name: "plain trailing prompt, no noise",
+			text: "\r\n\r\nOLT#",
+			want: "OLT#",
+		},
+		{
+			name: "real prompt followed by an async bracketed-timestamp log line",
+			text: "KRITIPUR-OLT>\r\n[1970/01/31 13:23:36]  [system]Warning: Login locally, please check the AAA settings",
+			want: "KRITIPUR-OLT>",
+		},
+		{
+			name: "multiple trailing log lines after the real prompt",
+			text: "OLT#\r\n[log] one\r\n[log] two",
+			want: "OLT#",
+		},
+		{
+			name: "everything looks like noise -- falls back to the literal last line",
+			text: "[log] one\r\n[log] two",
+			want: "[log] two",
+		},
+		{
+			name: "empty input",
+			text: "",
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := lastPromptLikeLine(tc.text); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCapturePromptNoOutputTimesOut(t *testing.T) {
 	source := newScriptedSource(func(written string, chunks chan<- []byte) {
 		// The device never responds at all.

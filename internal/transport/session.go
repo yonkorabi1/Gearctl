@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"log"
 	"strings"
 	"time"
 
@@ -59,6 +60,7 @@ func (s *StreamShellSession) Open(params ConnectionParams) error {
 	// "enable" with no password at all (see attemptEnable -- it only
 	// needs one if the device actually asks for one).
 	if isEnableStyleVendor(params.Vendor) && strings.HasSuffix(s.promptText, ">") {
+		log.Printf("enable: attempting for vendor=%q prompt=%q", params.Vendor, s.promptText)
 		nextPrompt, err := attemptEnable(
 			s.source,
 			s.promptText,
@@ -66,9 +68,14 @@ func (s *StreamShellSession) Open(params ConnectionParams) error {
 			time.Duration(params.ConnectTimeoutMs)*time.Millisecond,
 		)
 		if err != nil {
+			log.Printf("enable: failed: %v", err)
 			return err
 		}
+		log.Printf("enable: done, prompt now %q", nextPrompt)
 		s.promptText = nextPrompt
+	} else {
+		log.Printf("enable: skipped for vendor=%q prompt=%q (vendor allowlisted=%v, prompt ends with '>'=%v)",
+			params.Vendor, s.promptText, isEnableStyleVendor(params.Vendor), strings.HasSuffix(s.promptText, ">"))
 	}
 
 	if params.DisablePagingCommand != "" {
@@ -131,7 +138,7 @@ func (s *StreamShellSession) SendAndWaitForPrompt(command string, timeout time.D
 // (vendor allowlist + prompt shape, see Open()); this function itself has
 // no vendor knowledge.
 func attemptEnable(source *DataSource, promptText, enablePassword string, timeout time.Duration) (string, error) {
-	_, candidatePrompt, err := waitForPrompt(source, "enable", promptText, timeout)
+	output, candidatePrompt, err := waitForPrompt(source, "enable", promptText, timeout)
 	if err != nil {
 		// A failure here (timeout, session closed) is still a real
 		// connection-level problem worth surfacing, same as any other
@@ -139,6 +146,7 @@ func attemptEnable(source *DataSource, promptText, enablePassword string, timeou
 		// went wrong sending it".
 		return "", err
 	}
+	log.Printf("enable: device responded with output=%q candidatePrompt=%q", output, candidatePrompt)
 	if !passwordPattern.MatchString(candidatePrompt) {
 		return candidatePrompt, nil
 	}
