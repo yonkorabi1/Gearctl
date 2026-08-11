@@ -11,6 +11,7 @@ type ConnectionParams struct {
 	Host                 string
 	Port                 int
 	Protocol             string // "ssh" | "telnet"
+	Vendor               string // free-text hint from the `olts` table; see enablevendors.go
 	Username             string
 	Password             string
 	EnablePassword       string

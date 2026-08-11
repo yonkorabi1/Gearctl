@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"strings"
 	"time"
 
 	"github.com/onu-platform/olt-cli-gateway/internal/olterr"
@@ -49,6 +50,25 @@ func (s *StreamShellSession) Open(params ConnectionParams) error {
 	}
 	s.promptText = prompt
 
+	// Enable-style privileged-mode escalation is NOT universal (Huawei and
+	// Junos-lineage CLIs have no such concept, and Junos's normal prompt
+	// also ends in ">" -- see enablevendors.go for why this is an explicit
+	// vendor allowlist, not a prompt-shape guess) -- gated on vendor first,
+	// the ">" suffix second, and only attempted at all if an enable
+	// password was actually configured.
+	if params.EnablePassword != "" && isEnableStyleVendor(params.Vendor) && strings.HasSuffix(s.promptText, ">") {
+		nextPrompt, err := attemptEnable(
+			s.source,
+			s.promptText,
+			params.EnablePassword,
+			time.Duration(params.ConnectTimeoutMs)*time.Millisecond,
+		)
+		if err != nil {
+			return err
+		}
+		s.promptText = nextPrompt
+	}
+
 	if params.DisablePagingCommand != "" {
 		// Discard output -- this command's only purpose is to stop the
 		// device from blocking on a "--More--" style pager, not to report
@@ -84,6 +104,39 @@ func (s *StreamShellSession) SendAndWaitForPrompt(command string, timeout time.D
 		return truncateUTF8(output, MaxOutputBytes), true, nil
 	}
 	return output, false, nil
+}
+
+// attemptEnable sends the literal command "enable" and, only if the
+// device responds with something password-shaped, answers with
+// enablePassword and returns the resulting (re-derived) prompt. If the
+// device doesn't ask for a password at all -- unrecognized command,
+// already privileged, whatever the reason -- this is a no-op and the
+// original prompt is returned unchanged. Callers are expected to have
+// already decided this is worth trying (vendor allowlist + prompt shape,
+// see Open()); this function itself has no vendor knowledge.
+func attemptEnable(source *DataSource, promptText, enablePassword string, timeout time.Duration) (string, error) {
+	_, candidatePrompt, err := waitForPrompt(source, "enable", promptText, timeout)
+	if err != nil {
+		// A failure here (timeout, session closed) is still a real
+		// connection-level problem worth surfacing, same as any other
+		// command -- this isn't "enable didn't apply", it's "something
+		// went wrong sending it".
+		return "", err
+	}
+	if !passwordPattern.MatchString(candidatePrompt) {
+		// Whatever came back doesn't look like a password prompt -- no
+		// enable concept here after all, or already privileged. Keep
+		// going with the prompt as re-derived (harmless either way: if
+		// "enable" was rejected outright, the original prompt reappears
+		// unchanged and this is a pure no-op).
+		return candidatePrompt, nil
+	}
+	if err := source.Write(enablePassword + crlf); err != nil {
+		return "", olterr.New(olterr.TypeConnection, "failed to write enable password: "+err.Error())
+	}
+	// The credential's been sent; just settle on whatever prompt follows,
+	// the same way the initial post-login prompt was captured.
+	return capturePrompt(source, int(timeout/time.Millisecond))
 }
 
 func (s *StreamShellSession) Close() error {

@@ -82,6 +82,7 @@ func (r *ExecuteRequest) ToConnectionParams() transport.ConnectionParams {
 		Host:                 r.Host,
 		Port:                 r.Port,
 		Protocol:             r.Protocol,
+		Vendor:               r.Vendor,
 		Username:             r.Credentials.Username,
 		Password:             r.Credentials.Password,
 		EnablePassword:       r.Credentials.EnablePassword,
