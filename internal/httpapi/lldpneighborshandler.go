@@ -30,12 +30,18 @@ func LLDPNeighborsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	startedAt := time.Now()
+
+	if req.SessionID != "" {
+		runLLDPNeighborsOnSession(w, req.SessionID, startedAt)
+		return
+	}
+
 	if !security.IsAllowedOltTarget(req.Host) {
 		writeLLDPNeighborsValidationError(w, fmt.Sprintf("Target host %q is not allowed", req.Host))
 		return
 	}
 
-	startedAt := time.Now()
 	driver := drivers.Resolve(req.Vendor)
 
 	lldpProvider, ok := driver.(drivers.LLDPNeighborsProvider)
@@ -71,6 +77,53 @@ func LLDPNeighborsHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, LLDPNeighborsResponse{
 			Status:          "failed",
 			Error:           toExecuteError(err),
+			TotalDurationMs: time.Since(startedAt).Milliseconds(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, LLDPNeighborsResponse{
+		Status:          "success",
+		Neighbors:       neighbors,
+		ConnectedAt:     &connectedAt,
+		TotalDurationMs: time.Since(startedAt).Milliseconds(),
+	})
+}
+
+// runLLDPNeighborsOnSession is LLDPNeighborsHandler's session-based path
+// -- see runFactsOnSession's doc comment for the general pattern.
+func runLLDPNeighborsOnSession(w http.ResponseWriter, sessionID string, startedAt time.Time) {
+	sess, sessErr := acquireSession(sessionID)
+	if sessErr != nil {
+		writeJSON(w, http.StatusOK, LLDPNeighborsResponse{
+			Status:          "failed",
+			Error:           sessErr,
+			TotalDurationMs: time.Since(startedAt).Milliseconds(),
+		})
+		return
+	}
+	defer sessionStore.Release(sess)
+
+	lldpProvider, ok := sess.Driver.(drivers.LLDPNeighborsProvider)
+	if !ok {
+		writeJSON(w, http.StatusOK, LLDPNeighborsResponse{
+			Status: "failed",
+			Error: &ExecuteError{
+				Type:    "unsupported",
+				Message: fmt.Sprintf("vendor %q has no LLDP-capable driver", sess.Vendor),
+			},
+			TotalDurationMs: time.Since(startedAt).Milliseconds(),
+		})
+		return
+	}
+
+	connectedAt := sess.ConnectedAt.UTC().Format(time.RFC3339Nano)
+	neighbors, err := lldpProvider.GetLLDPNeighbors()
+	if err != nil {
+		writeJSON(w, http.StatusOK, LLDPNeighborsResponse{
+			Status:          "failed",
+			Error:           toExecuteError(err),
+			ConnectedAt:     &connectedAt,
 			TotalDurationMs: time.Since(startedAt).Milliseconds(),
 		})
 		return

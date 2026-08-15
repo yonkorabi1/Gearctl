@@ -3,9 +3,12 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/onu-platform/gearctl/internal/drivers"
 )
 
 func postConfig(t *testing.T, body string) (*httptest.ResponseRecorder, ConfigResponse) {
@@ -80,6 +83,47 @@ func TestConfigHandlerReportsUnsupportedForVendorsWithoutConfigGetter(t *testing
 	}
 	if resp.Config != nil {
 		t.Errorf("got config %v, want nil", resp.Config)
+	}
+}
+
+func TestConfigHandlerSessionNotFound(t *testing.T) {
+	rec, resp := postConfig(t, `{"sessionId": "does-not-exist"}`)
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Error == nil || resp.Error.Type != "session_not_found" {
+		t.Errorf("got error %+v, want type=session_not_found", resp.Error)
+	}
+}
+
+func TestConfigHandlerSucceedsViaSession(t *testing.T) {
+	driver := &fakeSessionDriver{vendor: "cisco", config: "hostname R1\nend\n"}
+	sessionID := openFakeSession(driver, "cisco")
+	defer func() { _ = sessionStore.Close(sessionID) }()
+
+	rec, resp := postConfig(t, fmt.Sprintf(`{"sessionId": %q}`, sessionID))
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Status != "success" {
+		t.Errorf("got status %q, want \"success\" (error: %+v)", resp.Status, resp.Error)
+	}
+	if resp.Config == nil || *resp.Config != "hostname R1\nend\n" {
+		t.Errorf("got config %v, want the fake driver's config", resp.Config)
+	}
+}
+
+func TestConfigHandlerReportsUnsupportedViaSession(t *testing.T) {
+	driver := &drivers.RawDriver{}
+	sessionID := openFakeSession(driver, "huawei")
+	defer func() { _ = sessionStore.Close(sessionID) }()
+
+	rec, resp := postConfig(t, fmt.Sprintf(`{"sessionId": %q}`, sessionID))
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Error == nil || resp.Error.Type != "unsupported" {
+		t.Errorf("got error %+v, want type=unsupported", resp.Error)
 	}
 }
 

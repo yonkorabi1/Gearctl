@@ -3,9 +3,12 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/onu-platform/gearctl/internal/drivers"
 )
 
 func postMergeConfig(t *testing.T, body string) (*httptest.ResponseRecorder, MergeConfigResponse) {
@@ -126,6 +129,55 @@ func TestMergeConfigHandlerReportsUnsupportedForVendorsWithoutConfigLoader(t *te
 	}
 	if resp.Applied {
 		t.Error("applied = true, want false")
+	}
+}
+
+func TestMergeConfigHandlerSessionNotFound(t *testing.T) {
+	rec, resp := postMergeConfig(t, `{"sessionId": "does-not-exist", "candidate": "hostname R1\n", "dryRun": true}`)
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Error == nil || resp.Error.Type != "session_not_found" {
+		t.Errorf("got error %+v, want type=session_not_found", resp.Error)
+	}
+}
+
+// TestMergeConfigHandlerSucceedsViaSession confirms the session path
+// reaches LoadConfig() on the pooled driver -- config PUSH via a session
+// is deliberately supported, unlike POST /v1/batch which excludes it
+// (see BatchRequest's doc comment) -- a session call is still exactly
+// one call in, one call out, so there's no batch-wide-outcome conflict.
+func TestMergeConfigHandlerSucceedsViaSession(t *testing.T) {
+	driver := &fakeSessionDriver{vendor: "cisco", diff: "+hostname R1", configHash: "abc123", applied: false}
+	sessionID := openFakeSession(driver, "cisco")
+	defer func() { _ = sessionStore.Close(sessionID) }()
+
+	rec, resp := postMergeConfig(t, fmt.Sprintf(`{"sessionId": %q, "candidate": "hostname R1\n", "dryRun": true}`, sessionID))
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Status != "success" {
+		t.Errorf("got status %q, want \"success\" (error: %+v)", resp.Status, resp.Error)
+	}
+	if resp.Diff == nil || *resp.Diff != "+hostname R1" {
+		t.Errorf("got diff %v, want \"+hostname R1\"", resp.Diff)
+	}
+	if resp.ConfigHash == nil || *resp.ConfigHash != "abc123" {
+		t.Errorf("got configHash %v, want \"abc123\"", resp.ConfigHash)
+	}
+}
+
+func TestMergeConfigHandlerReportsUnsupportedViaSession(t *testing.T) {
+	driver := &drivers.RawDriver{}
+	sessionID := openFakeSession(driver, "huawei")
+	defer func() { _ = sessionStore.Close(sessionID) }()
+
+	rec, resp := postMergeConfig(t, fmt.Sprintf(`{"sessionId": %q, "candidate": "hostname R1\n", "dryRun": true}`, sessionID))
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Error == nil || resp.Error.Type != "unsupported" {
+		t.Errorf("got error %+v, want type=unsupported", resp.Error)
 	}
 }
 

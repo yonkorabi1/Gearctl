@@ -208,6 +208,93 @@ fetches and report what happened to each."
 
 The HTTP equivalent is `POST /v1/batch` — see [Server mode](#server-mode--serve).
 
+### Session pooling
+
+**HTTP (`-serve` mode) only — there is no CLI equivalent.** A CLI
+invocation is its own OS process; there's no memory that outlives it for
+a session to live in, no matter what's built here. `-cmd`/`-facts`/etc.
+combined in one invocation (above) is as far as connection reuse can go
+for the CLI — for the HTTP API, sessions cover the case batching
+structurally can't: separate calls that arrive over time and don't know
+about each other up front.
+
+```bash
+# 1. Open a session -- credentials used exactly once, right here.
+curl -X POST http://localhost:8090/v1/session/open -H "X-Internal-Auth: ..." -d '{
+  "host": "10.0.0.1", "port": 22, "protocol": "ssh", "vendor": "cisco",
+  "credentials": {"username": "admin", "password": "secret"}
+}'
+# {"status":"success","sessionId":"S1wfAT...","vendor":"cisco","connectedAt":"...","totalDurationMs":485}
+
+# 2. Use the token instead of credentials for as many calls as you want,
+#    spread out over time -- every one of these runs against the SAME
+#    already-open connection (same connectedAt in every response).
+curl -X POST http://localhost:8090/v1/facts -H "X-Internal-Auth: ..." \
+  -d '{"sessionId": "S1wfAT..."}'
+curl -X POST http://localhost:8090/v1/interfaces -H "X-Internal-Auth: ..." \
+  -d '{"sessionId": "S1wfAT..."}'
+curl -X POST http://localhost:8090/v1/merge-cmd -H "X-Internal-Auth: ..." \
+  -d '{"sessionId": "S1wfAT...", "commands": ["interface GigabitEthernet1", "description new"], "dryRun": true}'
+
+# 3. Close it when you're done -- or just stop using it; an idle session
+#    closes itself after 30s with no activity either way.
+curl -X POST http://localhost:8090/v1/session/close -H "X-Internal-Auth: ..." \
+  -d '{"sessionId": "S1wfAT..."}'
+```
+
+**Every** operation endpoint accepts `sessionId` as an alternative to
+`host`/`port`/`protocol`/`vendor`/`credentials` — `/v1/execute`,
+`/v1/facts`, `/v1/interfaces`, `/v1/lldp-neighbors`, `/v1/config`,
+`/v1/merge-config`, and `/v1/merge-cmd` all work identically either way,
+reads and writes both (config push included — deliberately, unlike
+`/v1/batch`, which excludes it; see [Architecture](#architecture) for
+why that's not a contradiction). `/v1/batch` itself does **not** accept a
+`sessionId` — it already has its own one-connection-many-operations
+model for the "I know all my operations up front" case; sessions are for
+the case batching can't cover, not a replacement for it.
+
+**Why a token, not a credential-hash pool.** See
+[Architecture](#architecture) for the full reasoning — in short,
+`POST /v1/session/open` is the ONLY place credentials are ever used; it
+returns a fresh, high-entropy random ID (`crypto/rand`, never anything
+derived from the password) with no way to reconstruct or verify a
+password from it. Every later call needs only the token, so nothing
+credential-shaped has to be cached anywhere for the token to be reusable
+— a leaked token exposes "someone can drive this one connection for a
+little while," never anything about the underlying password.
+
+**Idle timeout: 30 seconds.** A session with no activity for 30s is
+closed and disconnected automatically, same as an explicit
+`POST /v1/session/close` — the connection doesn't linger indefinitely
+just because nobody remembered to close it. Every successful operation
+against a session resets its idle clock; only genuine inactivity counts.
+
+**Concurrency: one operation at a time, per session.** A device CLI
+session has exactly one prompt to read — it cannot safely run two
+commands at once. A second request arriving while a session is mid-operation
+waits briefly (default up to 5s) for the first to finish; if it's still
+busy after that, the second request gets a `session_busy` error rather
+than corrupting output by racing the first. This is a per-session limit,
+not a server-wide one — unrelated sessions run fully in parallel.
+
+**Failure modes are explicit, not silent:**
+- `session_not_found` — the ID doesn't match any currently-open session
+  (never existed, already closed, or idled out). Every operation
+  endpoint reports this the same way a fresh-connect call reports a bad
+  host.
+- `session_busy` — the session exists but is currently running another
+  operation and didn't free up within the wait.
+
+Closing an unknown/already-closed session is also reported as
+`session_not_found`, not silently treated as success — see
+`SessionCloseRequest`'s doc comment.
+
+See `internal/sessionpool`'s package doc comment for the full
+implementation (the lock-with-timeout design that avoids leaking a
+goroutine on a timed-out acquire, the idle-reaper loop, and why
+`Store.Open` never dials anything itself — it only ever registers a
+connection the caller already established).
+
 ### Merging a config change
 
 **Read this before using `-merge-config` or `-merge-cmd` — either writes
@@ -382,22 +469,50 @@ elsewhere plus the new one as an unrelated addition), and removing it via
 the surrounding ~7KB of config was untouched in every case (see
 `TestProjectMergedConfigPreservesUnrelatedLineOrder` for the regression
 test this live run caught before it did: an earlier version of the
-projection reordered the entire file for a one-line change). Same manual
-checklist below remains worth re-running for anything not yet exercised
-live (a genuinely new stanza, the `ip ...` two-token case, a rejected
-line mid-apply):
+projection reordered the entire file for a one-line change). A second
+live round -- toggling the global, context-less `ip scp server enable` on
+and off -- caught and fixed a real `no <rest>` removal bug (see
+[Testing](#testing) for the full story: it matched the wrong `ip ...`
+line before the fix, the wrong line was only ever in the *shown diff*,
+never the actual device write). Same manual checklist below remains worth
+re-running for anything not yet exercised live (the `ip ...` two-token
+case at stanza scope specifically -- the global case is now covered by
+the bug above -- and a rejected line mid-apply):
 
 1. A trivial, reversible change (e.g. an interface description) — dry
    run, confirm the projected diff shows a clean `-old`/`+new` pair in
    place (not the old line unchanged elsewhere plus the new line as an
    unrelated addition), apply, then `-config` again to confirm the
-   projected diff actually matched what landed on the device.
+   projected diff actually matched what landed on the device. **Done.**
 2. The same change expressed as `-merge-cmd "interface X" -merge-cmd
    "no shutdown"` (or similar) — confirm `no <cmd>` removal projects
-   correctly against an existing matching line.
+   correctly against an existing matching line. **Done** (at the global,
+   context-less scope -- see the bug above; still worth trying at stanza
+   scope with more than one same-first-token line present).
 3. A deliberately invalid command — confirm apply stops immediately,
    config mode is exited cleanly, and the error names the right line
    (same rejection-detection path `-merge-config` uses).
+
+**Compared against NAPALM's own config-merge path** (`napalm-bench/bench_merge.py`,
+same real ISR): NAPALM's `load_merge_candidate()` doesn't accept a bare
+delta the way `-merge-cmd` does -- it SCPs a config *file* to the
+device's flash and applies it via IOS's own `configure replace ...
+merge`, which needs `ip scp server enable` configured on the device
+first (a real operational prerequisite `-merge-cmd` has none of, since it
+never leaves the SSH session or writes to flash). More notably, its
+`compare_config()` diff for the exact same replace-a-description case
+this project's own design review anticipated turned out exactly as
+predicted: since NAPALM diffs the delta candidate directly against the
+running config rather than projecting a merged result first, the diff
+showed the *entire* small candidate snippet as a clean addition (`+
+interface GigabitEthernet1` / `+ description ...-REPLACED`) with no
+indication at all that an existing description was being overwritten --
+the same "naive diff" failure mode `-merge-cmd`'s projection step exists
+specifically to avoid. Its `no description` case was worse still: the
+diff showed `+interface GigabitEthernet1` / `-no description`, which
+doesn't meaningfully describe what changes on the device at all. Both
+tools' *actual applies* worked correctly in this test; the difference is
+entirely in what the operator sees before confirming.
 
 ### Server mode (`-serve`)
 
@@ -411,7 +526,9 @@ the environment.
 `GET /health` — unauthenticated, `{"status":"ok"}`.
 
 `POST /v1/execute` — requires `X-Internal-Auth: <shared secret>`. Runs
-caller-supplied commands.
+caller-supplied commands. Every field below (except `commands`) can be
+replaced with a single `sessionId` from `POST /v1/session/open` instead
+— see [Session pooling](#session-pooling) further down.
 
 ```json
 // Request
@@ -422,6 +539,8 @@ caller-supplied commands.
   "disablePagingCommand": "terminal length 0",
   "connectTimeoutMs": 10000, "perCommandTimeoutMs": 15000
 }
+// Equivalently, reusing an already-open session:
+// {"sessionId": "S1wfATmmWwQ7GImXXJhUXZcH1RG2RunLkFnogsDnuqg", "commands": ["show version"]}
 // Response
 {
   "status": "success",
@@ -690,6 +809,64 @@ for a request that never got far enough to attempt any operation
 (malformed JSON, validation failure, disallowed target) — distinct from
 each operation's own `error`, which is scoped to just that operation.
 
+`POST /v1/session/open` — requires `X-Internal-Auth`. Same request shape
+as `/v1/execute` minus `commands` (and `sessionId` must NOT be set — see
+[Session pooling](#session-pooling)). Dials a connection exactly like
+every other endpoint's fresh-connect path, but instead of running one
+operation and closing it, registers the connection in gearctl's session
+pool and returns a token to use instead of credentials on later calls.
+
+```json
+// Request
+{
+  "host": "10.0.0.1", "port": 22, "protocol": "ssh", "vendor": "cisco",
+  "credentials": {"username": "admin", "password": "secret"}
+}
+// Response
+{
+  "status": "success",
+  "sessionId": "S1wfATmmWwQ7GImXXJhUXZcH1RG2RunLkFnogsDnuqg",
+  "vendor": "cisco",
+  "error": null, "connectedAt": "...", "totalDurationMs": 485
+}
+```
+
+`sessionId` is a 256-bit random token (`crypto/rand`) — not derived from
+the credentials in any way, and the credentials themselves are never
+stored past this one call. Pass it as every other endpoint's `sessionId`
+field instead of `host`/`credentials`/etc. See [Session
+pooling](#session-pooling) for the idle-timeout/concurrency/error-mode
+details.
+
+`POST /v1/session/close` — requires `X-Internal-Auth`. Closes and
+disconnects a pooled session immediately, rather than waiting for it to
+idle out.
+
+```json
+// Request
+{"sessionId": "S1wfATmmWwQ7GImXXJhUXZcH1RG2RunLkFnogsDnuqg"}
+// Response
+{"status": "success", "error": null, "totalDurationMs": 0}
+```
+
+Closing an unknown, already-closed, or already-idled-out session reports
+`error.type: "session_not_found"`, not a silent success — a caller
+relying on this to free a resource deserves to know if there was nothing
+to free.
+
+**Every** operation endpoint (`/v1/execute`, `/v1/facts`,
+`/v1/interfaces`, `/v1/lldp-neighbors`, `/v1/config`, `/v1/merge-config`,
+`/v1/merge-cmd` — **not** `/v1/batch`, see [Session
+pooling](#session-pooling)) accepts `sessionId` as a top-level field,
+replacing `host`/`port`/`protocol`/`vendor`/`credentials` entirely:
+
+```json
+// Instead of the usual host/port/protocol/credentials shape:
+{"sessionId": "S1wfATmmWwQ7GImXXJhUXZcH1RG2RunLkFnogsDnuqg"}
+// or, for /v1/execute:
+{"sessionId": "S1wfATmmWwQ7GImXXJhUXZcH1RG2RunLkFnogsDnuqg", "commands": ["show version"]}
+```
+
 `status` is one of `success` (all commands/facts/interfaces/config/
 merge-attempt calls completed as expected), `partial` (some commands or
 batch operations failed — `/v1/execute` and `/v1/batch` only), or
@@ -705,6 +882,8 @@ batch operations failed — `/v1/execute` and `/v1/batch` only), or
 | `connection` | Couldn't reach the device (dial failure, refused, etc.), or the connection dropped mid-`/v1/merge-config`/`/v1/merge-cmd` apply (see [Merging a config change](#merging-a-config-change)) |
 | `protocol` | Something went wrong at the SSH/Telnet/session level |
 | `unsupported` | *(`/v1/facts`, `/v1/interfaces`, `/v1/lldp-neighbors`, `/v1/config`, `/v1/merge-config`, `/v1/merge-cmd` only)* The resolved vendor has no `FactsProvider`/`InterfaceProvider`/`LLDPNeighborsProvider`/`ConfigGetter`/`ConfigLoader`-capable driver. `/v1/batch` reports this per-operation (`results[i].error.type`), not at the top level — see [`POST /v1/batch`](#server-mode--serve) |
+| `session_not_found` | *(any endpoint accepting `sessionId`, plus `/v1/session/close`)* No currently-open session matches the given `sessionId` — never existed, already closed, or idled out (see [Session pooling](#session-pooling)) |
+| `session_busy` | *(any endpoint accepting `sessionId`)* The session exists but is running another operation and didn't free up within the wait — try again shortly |
 
 ## Vendor support
 
@@ -747,42 +926,59 @@ CLIs have no such concept and are correctly skipped.
 
 ## Architecture
 
-This service is **stateless** — no database, no credential storage, no
-memory of past runs. Everything needed for one command run arrives in the
-request body (or CLI flags); nothing is persisted here. A caller like
-`platform-api` (specifically its `modules/olt-cli/` module) is expected to
-own identity/credentials/run-history itself and call this service
-per-request.
+This service holds **no database, no credential storage, no memory of
+past runs** — everything needed for one command run arrives in the
+request body (or CLI flags), and nothing about *who you are* is ever
+persisted here. The one deliberate exception is [session
+pooling](#session-pooling) below: an open, already-authenticated
+*connection* can outlive the single request that created it, for up to
+30 seconds of inactivity — but never the credentials that authenticated
+it, which are used exactly once and then discarded. A caller like
+`platform-api` (specifically its `modules/olt-cli/` module) is expected
+to own identity/credentials/run-history itself and call this service
+per-request (or per-session).
 
 ```
 caller --POST /v1/execute (X-Internal-Auth)--> gearctl --SSH/Telnet--> device
 ```
 
-**Why there's a batch endpoint but no connection pooling.** A benchmark
-against NAPALM/Netmiko on the same real device (`napalm-bench/`, a
-standalone spin-off container, not part of gearctl itself) found NAPALM's
-session-reuse model — open once, run several getters, close once — beats
+**Two connection-reuse features, layered on for two different
+shapes of the same underlying problem.** A benchmark against
+NAPALM/Netmiko on the same real device (`napalm-bench/`, a standalone
+spin-off container, not part of gearctl itself) found NAPALM's
+session-reuse model — open once, run several getters, close once — beat
 gearctl's original per-call connect-then-close for any multi-fact
-scenario, purely on connection setup/teardown overhead. The tempting fix,
-pooling an already-authenticated connection across genuinely *separate*
-incoming requests, was deliberately rejected: reusing a pooled connection
-for a new request means validating that request's credentials against
-whatever authenticated the pooled session, which means holding some
-credential-comparison material (e.g. a password hash) in memory for as
-long as the connection stays open — a real, if bounded/short-TTL,
-deviation from "no credential ever outlives one request." That's a
-security/speed tradeoff with no free lunch either direction.
+scenario, purely on connection setup/teardown overhead.
 
-`runBatchModes` (CLI, `main.go`) and `BatchHandler`
-(`internal/httpapi/batchhandler.go`, backing `POST /v1/batch`) get the
-same connection-reuse win with **zero** change to the stateless design
-instead: one connection, multiple *independent, read-only* operations run
-against it, all within a single request/response (or single CLI
-invocation)'s lifecycle — no session ID, no idle timeout or cleanup
-logic, no credential caching, nothing that outlives the call that opened
-it. Config *push* (`-merge-config`/`-merge-cmd`) is deliberately excluded
-from both — their dry-run/hash-freshness/interactive-confirm flow doesn't
-compose with "run N things and report what happened to each."
+The first fix, batching (`runBatchModes` in CLI `main.go`, `BatchHandler`
+backing `POST /v1/batch`), covers the case where a caller knows every
+operation it wants *up front*, in one call: one connection, multiple
+*independent, read-only* operations run against it, all within a single
+request/response (or single CLI invocation)'s lifecycle — no session ID,
+no idle timeout, no credential caching, nothing that outlives the call
+that opened it. Config *push* (`-merge-config`/`-merge-cmd`) is
+deliberately excluded — their dry-run/hash-freshness/interactive-confirm
+flow doesn't compose with "run N things and report what happened to
+each."
+
+The second, [session pooling](#session-pooling), covers the case
+batching structurally can't: separate calls arriving over time, that
+don't know about each other ahead of time (a `-facts` call now, a
+`-merge-cmd` two minutes later, from what might even be different
+processes). Naively pooling a connection across genuinely separate
+requests has an obvious-looking approach that was deliberately rejected:
+reusing a pooled connection for a new request by validating that
+request's credentials against whatever authenticated the pooled session
+means holding some credential-comparison material (e.g. a password hash)
+in memory for as long as the connection stays open — a real deviation
+from "no credential ever outlives one request." Session pooling gets the
+same reuse win without that tradeoff: `POST /v1/session/open` takes
+credentials exactly once and returns a fresh, high-entropy random token
+with zero mathematical relationship to the password — reuse afterward
+requires only the token (a bearer-capability, like a database
+connection-pool checkout), never the credentials again. See [Session
+pooling](#session-pooling) for the full design and
+`internal/sessionpool`'s package doc comment for the implementation.
 
 ### The driver seam (NAPALM-like)
 
@@ -888,6 +1084,68 @@ semantics) is not implemented by any driver -- kept as a conceptually
 separate, not-yet-declared interface, since it's a meaningfully different
 (and differently risky) operation.
 
+#### Prompt prediction: why config-mode commands used to be much slower
+
+`applyMergeConfig` sends `"configure terminal"`, each delta line, and
+`"end"` one at a time (see its own doc comment for why one at a time, not
+batched). Three of those -- entering config mode, an
+`interface`/`router`/`line` context opener, and `end` -- change the
+device's prompt (e.g. `ISR#` → `ISR(config)#` → `ISR(config-if)#` →
+back to `ISR#`). gearctl's transport layer has no vendor-specific prompt
+grammar of its own (see [Prompt-return detection](#prompt-return-detection)
+below): when a command changes the prompt, the fast substring-match path
+can't find the OLD (now-stale) prompt text in the response, so it falls
+back to waiting out the full `commandQuiescenceMs` (2 seconds) of silence
+before concluding the device is done -- **on every single mode-changing
+command**. For a typical `-merge-cmd` apply (`configure terminal` +
+`interface X` + one child line + `end`), that's up to 3 unnecessary
+2-second waits stacked on top of what should be a sub-second round trip.
+This was the real, measured cause behind `-merge-cmd`'s apply times
+looking slow next to NAPALM's in the [comparison
+report](https://claude.ai/code/artifact/b15e5f24-9cb0-4c6b-b0dc-3c3fab452c3a) --
+found by actually profiling it after being asked "why is ours slower?",
+not guessed at.
+
+The fix: `CiscoIOSDriver.predictNextPrompt(currentPrompt, cmd)` knows
+Cisco's own prompt grammar well enough to guess the *upcoming* prompt for
+exactly these three transitions (deriving the hostname from whatever the
+device's prompt looks like right now, via the new
+`ShellSession.CurrentPrompt()`), and passes that guess to a new
+`SendAndWaitForPromptHint` -- the SAME fast substring-match path a
+steady-prompt command already gets, just given the right prompt to look
+for instead of a stale one. A wrong guess is never unsafe: if the hint
+doesn't actually appear, `waitForPrompt`'s existing quiescence fallback
+still fires and self-corrects exactly as if no hint had been given at
+all (see `TestStreamShellSessionWrongHintStillSelfCorrectsViaQuiescence`)
+-- this is purely a speed optimization with a safety net, not a new way
+to get the wrong answer faster.
+
+**Verified live** against the real Cisco ISRv: the same add/replace/remove
+interface-description sequence from the NAPALM comparison, averaged over
+3 runs each, before and after this fix:
+
+| Step | Before (no hint) | After (with hint) |
+|---|---|---|
+| Add | 9,216 ms | 5,161 ms |
+| Replace | 9,059 ms | 5,145 ms |
+| Remove | 7,016 ms | 3,058 ms |
+
+**gearctl's `-merge-cmd` now beats NAPALM's equivalent merge
+(8,297 / 5,452 / 5,478 ms) on all three steps** -- despite gearctl paying
+its own connect/disconnect cost per call where NAPALM's numbers share one
+open session (merges aren't batchable, see [Combining modes /
+batching](#combining-modes--batching)). One honest loose end: `remove`
+is consistently ~2 seconds faster than `add`/`replace` even though all
+three send the identical three mode-changing commands -- not yet
+explained, flagged here rather than papered over, and not blocking
+anything since the actual applied commands and their correctness are
+unaffected either way.
+
+At the mock-session level (no real device involved, so the timing itself
+is deterministic, not just "usually fast"): a correct hint completes in
+~0.3s against a scripted mode change that takes 2.33s without one (see
+`TestStreamShellSessionHintAvoidsQuiescenceFallbackOnModeChange`).
+
 #### Adding a vendor driver
 
 1. Create `internal/drivers/<vendor>driver.go` with a struct embedding
@@ -936,6 +1194,20 @@ stateful multi-command sessions) and Telnet (`internal/transport/telnetsession.g
 hand-rolled on a raw `net.Conn` — no third-party Telnet library; see below)
 funnel through this same logic via the `DataSource`/`ShellSession`
 abstraction in `internal/transport/types.go` and `internal/transport/session.go`.
+
+**Prompt prediction (`SendAndWaitForPromptHint`/`CurrentPrompt`):** this
+package has zero vendor-specific prompt grammar by design, so a command
+that changes the prompt (entering config mode, say) can't be matched via
+the fast substring path above — the old prompt text is gone, and the new
+one isn't known in advance. Without help, that means a full
+`commandQuiescenceMs` (2s) wait on every such command. A caller that DOES
+know its vendor's prompt grammar (`CiscoIOSDriver.predictNextPrompt`, see
+[Prompt prediction](#prompt-prediction-why-config-mode-commands-used-to-be-much-slower)
+above) can pass a predicted prompt through `SendAndWaitForPromptHint`
+instead of the plain `SendAndWaitForPrompt`, getting the same fast path a
+steady-prompt command already gets. A wrong guess just falls back to the
+same quiescence behavior as no hint at all — this package's own logic
+doesn't change, it just gets a better first guess when one's available.
 
 ### Telnet: hand-rolled IAC parsing, with real hardware fixes baked in
 
@@ -1018,9 +1290,26 @@ syslog-style `%SYS-...` messages); stopping on a connection drop (`end`
 fresh hash succeeds); and multi-line-directive refusal before ever
 connecting.
 
+`predictNextPrompt` (the prompt-prediction speedup — see [Prompt
+prediction](#prompt-prediction-why-config-mode-commands-used-to-be-much-slower))
+has its own table test (`TestPredictNextPrompt`) covering every
+transition `applyMergeConfig` actually sends, plus
+`TestApplyMergeConfigPassesPredictedPromptHints`, confirming the ACTUAL
+hint values `runSingle` computes and passes down for a real
+`applyMergeConfig` run, not just the pure function in isolation. The
+underlying transport-level mechanism (`SendAndWaitForPromptHint`) has its
+own mock-session tests in `internal/transport/session_test.go`:
+`TestStreamShellSessionHintAvoidsQuiescenceFallbackOnModeChange` proves a
+correct hint completes in ~0.3s against a scripted mode change that takes
+2.33s without one, and `TestStreamShellSessionWrongHintStillSelfCorrectsViaQuiescence`
+proves a wrong hint is never unsafe — just as slow as no hint at all,
+never a wrong result.
+
 `LoadMergeCommands()`'s stanza-locating/projection/reconciliation logic
 (`mergecmd_test.go`) is table-driven-tested separately from the above:
-replace-in-place, `no <cmd>`-as-removal, clean addition, new-stanza
+replace-in-place, `no <cmd>`-as-removal (matched via the same `matchKey`
+the replace/add path uses, ip-prefix two-token special case included --
+see below for the live-caught bug this fixed), clean addition, new-stanza
 addition, the `ip ...`-prefix two-token match-key special case, sibling
 `interface X` → `interface Y` context switches with no `exit` between
 them, a bare context-less delta (e.g. `hostname new-name`) resolving
@@ -1051,6 +1340,28 @@ asserts the config comes back byte-identical to the original, not just
 against a real Cisco ISRv — adding, replacing, and removing (`no
 description`) an interface description all matched their projected
 diffs exactly, with the rest of the ~7KB config untouched in every case.
+
+**A real bug was caught live during this verification**, dogfooding
+`-merge-cmd` to toggle `ip scp server enable` on and off (to unblock a
+NAPALM config-merge comparison, which needs SCP enabled to push its
+candidate file): `no ip scp server enable`'s projected diff showed the
+*wrong* line being removed -- `ip domain name isr.com` instead of `ip scp
+server enable`. Root cause: the `no <rest>` removal match used a plain
+first-token key (`"ip"`), while the replace/add path already special-cased
+the overloaded `ip` prefix down to a two-token key (`"ip scp"` vs `"ip
+domain"`) specifically to avoid this kind of collision -- removal just
+hadn't been given the same protection. **The actual device write was
+never wrong** -- apply only ever replays the literal delta command, never
+the projection (see `projectMergedConfig`'s doc comment); `ip scp server
+enable` really was removed, `ip domain name isr.com` really was left
+alone -- but the *diff* shown for review was misleading, which matters for
+a "review carefully before applying" feature. Fixed by having `no <rest>`
+share the exact same `matchKey` (ip-prefix special case included) the
+replace/add path uses; see
+`TestProjectMergedConfigNoRemovalUsesIPTwoTokenMatchKey` and its
+stanza-scoped sibling for the regression tests, and re-verified live
+after the fix (the same toggle now shows the correct line in its diff).
+
 `LoadConfig()`'s apply path (the full-candidate-file sibling) still
 hasn't — see [Merging a config change](#merging-a-config-change) for its
 manual test checklist to run before trusting it in production. Also
@@ -1073,3 +1384,50 @@ combination have been verified live against a real Cisco ISRv: one
 `interfaces`+`lldp-neighbors` `/v1/batch` call, both over a single
 connection (`connectedAt` set once), all requested sections populated
 correctly in one response/output.
+
+**Session pooling** (`internal/sessionpool/store_test.go`) is tested with
+a fake `drivers.CliDriver` double (this package never dials anything
+itself, see its doc comment) covering: open/acquire/release; a second
+`Acquire` while the first holder still has the lock getting `ErrBusy`,
+then succeeding once `Release` is called; a timed-out `Acquire` NOT
+leaking the lock (the regression test for the exact bug a
+`sync.Mutex`-plus-goroutine try-lock would have — see
+`TestStoreAcquireTimeoutDoesNotLeakTheLock`'s doc comment for why the
+channel-based lock design avoids it); `Close` disconnecting and removing
+a session; the idle reaper actually disconnecting and removing a session
+once its timeout elapses, and NOT reaping one that's had recent activity
+(`TestStoreReleaseResetsIdleClock`); and 100 generated IDs all unique and
+non-empty.
+
+Every operation handler's session-based path (`factshandler_test.go` and
+its five siblings, plus `sessionopenhandler_test.go`/
+`sessionclosehandler_test.go`) is tested via a shared `fakeSessionDriver`
+(`session_fake_driver_test.go`) registered directly into the shared
+`sessionStore` — bypassing any real network connection entirely, since
+`sessionpool.Store.Open` never dials anything itself. This is genuinely
+new test coverage the fresh-connection path structurally couldn't offer:
+every other handler test in this package can only exercise
+validation/connection-error paths without a real reachable device (see
+e.g. `TestFactsHandlerReturnsFailedForConnectionError`), but a
+session-based test can inject a fake already-"connected" driver and
+assert a real **success** response — confirming each handler actually
+reaches the pooled driver, not a fresh one, when `sessionId` is set, and
+that a session-based call never calls `Disconnect()` on the pooled
+connection. Each handler's suite covers: unknown/expired `sessionId` →
+`session_not_found`; success via a fake driver implementing every
+optional capability; and (for every handler except `/v1/execute`, which
+has no capability check — `RunCommands` is on the base `CliDriver`
+interface every driver implements) `unsupported` via a bare
+`*drivers.RawDriver{}` registered into a session, confirming the type
+assertion fails cleanly without ever needing a real connection.
+
+Verified live against the real Cisco ISRv: `POST /v1/session/open`
+followed by `/v1/facts`, `/v1/interfaces`, and `/v1/config` all reusing
+the identical `connectedAt` (proving one real shared connection, not
+three); a `/v1/merge-cmd` dry-run-then-apply pair through the same
+session, confirmed to land on the device and be readable back through
+`/v1/interfaces` on that same session; explicit `POST /v1/session/close`
+followed by a call against the closed ID correctly reporting
+`session_not_found`; and the 30-second idle timeout, confirmed by
+opening a session, waiting past it with no activity, and getting
+`session_not_found` on the next call with no explicit close ever sent.

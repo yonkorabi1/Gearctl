@@ -24,12 +24,18 @@ func ExecuteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	startedAt := time.Now()
+
+	if req.SessionID != "" {
+		runExecuteOnSession(w, req.SessionID, req.Commands, startedAt)
+		return
+	}
+
 	if !security.IsAllowedOltTarget(req.Host) {
 		writeValidationError(w, fmt.Sprintf("Target host %q is not allowed", req.Host))
 		return
 	}
 
-	startedAt := time.Now()
 	params := req.ToConnectionParams()
 	driver := drivers.Resolve(req.Vendor)
 
@@ -62,8 +68,63 @@ func ExecuteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeJSON(w, http.StatusOK, ExecuteResponse{
+		Status:          commandsResultStatus(results),
+		Results:         results,
+		Error:           nil,
+		ConnectedAt:     &connectedAt,
+		TotalDurationMs: time.Since(startedAt).Milliseconds(),
+	})
+}
+
+// runExecuteOnSession is ExecuteHandler's session-based path -- see
+// runFactsOnSession's doc comment for the general pattern. No
+// vendor-capability check here, unlike the other session-path
+// functions: RunCommands is on the base CliDriver interface every
+// resolved driver implements, so there's nothing to be "unsupported".
+func runExecuteOnSession(w http.ResponseWriter, sessionID string, commands []string, startedAt time.Time) {
+	sess, sessErr := acquireSession(sessionID)
+	if sessErr != nil {
+		writeJSON(w, http.StatusOK, ExecuteResponse{
+			Status:          "failed",
+			Results:         []transport.CommandResult{},
+			Error:           sessErr,
+			TotalDurationMs: time.Since(startedAt).Milliseconds(),
+		})
+		return
+	}
+	defer sessionStore.Release(sess)
+
+	connectedAt := sess.ConnectedAt.UTC().Format(time.RFC3339Nano)
+	results, err := sess.Driver.RunCommands(commands)
+	if err != nil {
+		writeJSON(w, http.StatusOK, ExecuteResponse{
+			Status:          "failed",
+			Results:         []transport.CommandResult{},
+			Error:           toExecuteError(err),
+			ConnectedAt:     &connectedAt,
+			TotalDurationMs: time.Since(startedAt).Milliseconds(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, ExecuteResponse{
+		Status:          commandsResultStatus(results),
+		Results:         results,
+		Error:           nil,
+		ConnectedAt:     &connectedAt,
+		TotalDurationMs: time.Since(startedAt).Milliseconds(),
+	})
+}
+
+// commandsResultStatus is /v1/execute's "some commands failed"
+// convention, shared by both the fresh-connection and session-based
+// paths: "success" if every command succeeded, "partial" if some did and
+// some didn't, "failed" if none did (matches JS's Array.prototype.every
+// on an empty array -- allFailed starts true).
+func commandsResultStatus(results []transport.CommandResult) string {
 	anyFailed := false
-	allFailed := true // matches JS Array.prototype.every on an empty array
+	allFailed := true
 	for _, res := range results {
 		if res.Error != "" {
 			anyFailed = true
@@ -71,21 +132,14 @@ func ExecuteHandler(w http.ResponseWriter, r *http.Request) {
 			allFailed = false
 		}
 	}
-	status := "success"
 	switch {
 	case allFailed:
-		status = "failed"
+		return "failed"
 	case anyFailed:
-		status = "partial"
+		return "partial"
+	default:
+		return "success"
 	}
-
-	writeJSON(w, http.StatusOK, ExecuteResponse{
-		Status:          status,
-		Results:         results,
-		Error:           nil,
-		ConnectedAt:     &connectedAt,
-		TotalDurationMs: time.Since(startedAt).Milliseconds(),
-	})
 }
 
 func toExecuteError(err error) *ExecuteError {

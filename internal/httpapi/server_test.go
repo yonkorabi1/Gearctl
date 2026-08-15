@@ -206,3 +206,49 @@ func TestServerMergeCmdWithValidAuthReachesHandler(t *testing.T) {
 		t.Fatalf("got status %d, want 400 (routed past auth into validation)", rec.Code)
 	}
 }
+
+func TestServerSessionOpenRequiresAuth(t *testing.T) {
+	server := NewServer("s3cret")
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/open", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("got status %d, want 401", rec.Code)
+	}
+}
+
+func TestServerSessionOpenWithValidAuthReachesHandler(t *testing.T) {
+	server := NewServer("s3cret")
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/open", nil)
+	req.Header.Set("X-Internal-Auth", "s3cret")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got status %d, want 400 (routed past auth into validation)", rec.Code)
+	}
+}
+
+func TestServerSessionCloseRequiresAuth(t *testing.T) {
+	server := NewServer("s3cret")
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/close", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("got status %d, want 401", rec.Code)
+	}
+}
+
+func TestServerSessionCloseWithValidAuthReachesHandler(t *testing.T) {
+	server := NewServer("s3cret")
+	req := httptest.NewRequest(http.MethodPost, "/v1/session/close", nil)
+	req.Header.Set("X-Internal-Auth", "s3cret")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("got status %d, want 400 (routed past auth into validation)", rec.Code)
+	}
+}

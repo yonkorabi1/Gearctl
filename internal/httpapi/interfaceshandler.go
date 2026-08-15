@@ -30,12 +30,18 @@ func InterfacesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	startedAt := time.Now()
+
+	if req.SessionID != "" {
+		runInterfacesOnSession(w, req.SessionID, startedAt)
+		return
+	}
+
 	if !security.IsAllowedOltTarget(req.Host) {
 		writeInterfacesValidationError(w, fmt.Sprintf("Target host %q is not allowed", req.Host))
 		return
 	}
 
-	startedAt := time.Now()
 	driver := drivers.Resolve(req.Vendor)
 
 	interfaceProvider, ok := driver.(drivers.InterfaceProvider)
@@ -71,6 +77,53 @@ func InterfacesHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, InterfacesResponse{
 			Status:          "failed",
 			Error:           toExecuteError(err),
+			TotalDurationMs: time.Since(startedAt).Milliseconds(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, InterfacesResponse{
+		Status:          "success",
+		Interfaces:      interfaces,
+		ConnectedAt:     &connectedAt,
+		TotalDurationMs: time.Since(startedAt).Milliseconds(),
+	})
+}
+
+// runInterfacesOnSession is InterfacesHandler's session-based path -- see
+// runFactsOnSession's doc comment for the general pattern.
+func runInterfacesOnSession(w http.ResponseWriter, sessionID string, startedAt time.Time) {
+	sess, sessErr := acquireSession(sessionID)
+	if sessErr != nil {
+		writeJSON(w, http.StatusOK, InterfacesResponse{
+			Status:          "failed",
+			Error:           sessErr,
+			TotalDurationMs: time.Since(startedAt).Milliseconds(),
+		})
+		return
+	}
+	defer sessionStore.Release(sess)
+
+	interfaceProvider, ok := sess.Driver.(drivers.InterfaceProvider)
+	if !ok {
+		writeJSON(w, http.StatusOK, InterfacesResponse{
+			Status: "failed",
+			Error: &ExecuteError{
+				Type:    "unsupported",
+				Message: fmt.Sprintf("vendor %q has no interfaces-capable driver", sess.Vendor),
+			},
+			TotalDurationMs: time.Since(startedAt).Milliseconds(),
+		})
+		return
+	}
+
+	connectedAt := sess.ConnectedAt.UTC().Format(time.RFC3339Nano)
+	interfaces, err := interfaceProvider.GetInterfaces()
+	if err != nil {
+		writeJSON(w, http.StatusOK, InterfacesResponse{
+			Status:          "failed",
+			Error:           toExecuteError(err),
+			ConnectedAt:     &connectedAt,
 			TotalDurationMs: time.Since(startedAt).Milliseconds(),
 		})
 		return

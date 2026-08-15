@@ -28,11 +28,21 @@ type ConnectionRequest struct {
 	DisablePagingCommand string      `json:"disablePagingCommand,omitempty"`
 	ConnectTimeoutMs     *int        `json:"connectTimeoutMs,omitempty"`
 	PerCommandTimeoutMs  *int        `json:"perCommandTimeoutMs,omitempty"`
+
+	// SessionID, if set, means this request runs against an
+	// already-open pooled session (see POST /v1/session/open) instead of
+	// dialing a fresh connection -- every field above is ignored when
+	// this is set (the session already has its own vendor/credentials
+	// from whenever it was opened). See validateConnectionOrSession.
+	SessionID string `json:"sessionId,omitempty"`
 }
 
 // validateConnection checks everything ExecuteRequest and FactsRequest
 // have in common. Returns a human-readable message describing the first
-// violation found, or "" if valid.
+// violation found, or "" if valid. Used unconditionally by
+// SessionOpenRequest (opening a session always needs full connection
+// details -- there's no session to reuse yet) and by every other
+// request's validateConnectionOrSession below when SessionID is empty.
 func (r *ConnectionRequest) validateConnection() string {
 	if r.Host == "" {
 		return "host is required"
@@ -56,6 +66,23 @@ func (r *ConnectionRequest) validateConnection() string {
 		return "perCommandTimeoutMs must be between 1 and 120000"
 	}
 	return ""
+}
+
+// validateConnectionOrSession is validateConnection's session-aware
+// sibling, used by every per-operation request (Execute/Facts/
+// Interfaces/LLDPNeighbors/Config/MergeConfig/MergeCmd -- NOT
+// SessionOpenRequest, which always needs full connection details, or
+// SessionCloseRequest, which only needs a SessionID and validates that
+// itself). When SessionID is set, none of host/port/protocol/credentials
+// matter -- the session already has an authenticated connection open, and
+// its own stored vendor decides what's supported -- so this skips
+// straight past validateConnection entirely rather than requiring fields
+// the caller has no reason to send.
+func (r *ConnectionRequest) validateConnectionOrSession() string {
+	if r.SessionID != "" {
+		return ""
+	}
+	return r.validateConnection()
 }
 
 func (r *ConnectionRequest) toConnectionParams() transport.ConnectionParams {
@@ -93,7 +120,7 @@ type ExecuteRequest struct {
 // Validate returns a human-readable message describing the first
 // violation found, or "" if the request is valid.
 func (r *ExecuteRequest) Validate() string {
-	if msg := r.validateConnection(); msg != "" {
+	if msg := r.validateConnectionOrSession(); msg != "" {
 		return msg
 	}
 	if len(r.Commands) == 0 {
@@ -122,7 +149,7 @@ type FactsRequest struct {
 }
 
 func (r *FactsRequest) Validate() string {
-	return r.validateConnection()
+	return r.validateConnectionOrSession()
 }
 
 func (r *FactsRequest) ToConnectionParams() transport.ConnectionParams {
@@ -137,7 +164,7 @@ type ConfigRequest struct {
 }
 
 func (r *ConfigRequest) Validate() string {
-	return r.validateConnection()
+	return r.validateConnectionOrSession()
 }
 
 func (r *ConfigRequest) ToConnectionParams() transport.ConnectionParams {
@@ -153,7 +180,7 @@ type InterfacesRequest struct {
 }
 
 func (r *InterfacesRequest) Validate() string {
-	return r.validateConnection()
+	return r.validateConnectionOrSession()
 }
 
 func (r *InterfacesRequest) ToConnectionParams() transport.ConnectionParams {
@@ -169,7 +196,7 @@ type LLDPNeighborsRequest struct {
 }
 
 func (r *LLDPNeighborsRequest) Validate() string {
-	return r.validateConnection()
+	return r.validateConnectionOrSession()
 }
 
 func (r *LLDPNeighborsRequest) ToConnectionParams() transport.ConnectionParams {
@@ -279,7 +306,7 @@ type MergeConfigRequest struct {
 }
 
 func (r *MergeConfigRequest) Validate() string {
-	if msg := r.validateConnection(); msg != "" {
+	if msg := r.validateConnectionOrSession(); msg != "" {
 		return msg
 	}
 	if r.Candidate == "" {
@@ -313,7 +340,7 @@ type MergeCmdRequest struct {
 }
 
 func (r *MergeCmdRequest) Validate() string {
-	if msg := r.validateConnection(); msg != "" {
+	if msg := r.validateConnectionOrSession(); msg != "" {
 		return msg
 	}
 	if len(r.Commands) == 0 {
@@ -472,5 +499,63 @@ type MergeConfigResponse struct {
 	Applied         bool          `json:"applied"`
 	Error           *ExecuteError `json:"error"`
 	ConnectedAt     *string       `json:"connectedAt"`
+	TotalDurationMs int64         `json:"totalDurationMs"`
+}
+
+// SessionOpenRequest is POST /v1/session/open's request -- exactly
+// ConnectionRequest's fields (a session always needs full connection
+// details; there's nothing to reuse yet), embedded rather than
+// duplicated. SessionID must NOT be set here -- see Validate.
+type SessionOpenRequest struct {
+	ConnectionRequest
+}
+
+func (r *SessionOpenRequest) Validate() string {
+	if r.SessionID != "" {
+		return "sessionId must not be set when opening a new session"
+	}
+	return r.validateConnection()
+}
+
+func (r *SessionOpenRequest) ToConnectionParams() transport.ConnectionParams {
+	return r.toConnectionParams()
+}
+
+// SessionOpenResponse is POST /v1/session/open's response. SessionID is
+// the opaque token to pass as every subsequent request's `sessionId`
+// field instead of host/credentials -- see internal/sessionpool's package
+// doc comment for why this is a fresh random value, never anything
+// derived from the credentials that opened it. ConnectedAt is when the
+// underlying connection was established (once, here) -- every later
+// operation against this session echoes the SAME ConnectedAt back,
+// since it describes the connection, not any one operation run over it.
+type SessionOpenResponse struct {
+	Status          string        `json:"status"`
+	SessionID       string        `json:"sessionId,omitempty"`
+	Vendor          string        `json:"vendor,omitempty"`
+	Error           *ExecuteError `json:"error"`
+	ConnectedAt     *string       `json:"connectedAt"`
+	TotalDurationMs int64         `json:"totalDurationMs"`
+}
+
+// SessionCloseRequest is POST /v1/session/close's request -- just the
+// token to close. Closing an already-closed or unknown session is a
+// clearly-reported error (session_not_found), not silently treated as
+// success -- a caller relying on close to free a resource deserves to
+// know if there was nothing to free.
+type SessionCloseRequest struct {
+	SessionID string `json:"sessionId"`
+}
+
+func (r *SessionCloseRequest) Validate() string {
+	if r.SessionID == "" {
+		return "sessionId is required"
+	}
+	return ""
+}
+
+type SessionCloseResponse struct {
+	Status          string        `json:"status"`
+	Error           *ExecuteError `json:"error"`
 	TotalDurationMs int64         `json:"totalDurationMs"`
 }

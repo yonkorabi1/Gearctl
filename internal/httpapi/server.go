@@ -20,5 +20,7 @@ func NewServer(sharedSecret string) http.Handler {
 	mux.Handle("POST /v1/config", auth.Middleware(sharedSecret, http.HandlerFunc(ConfigHandler)))
 	mux.Handle("POST /v1/merge-config", auth.Middleware(sharedSecret, http.HandlerFunc(MergeConfigHandler)))
 	mux.Handle("POST /v1/merge-cmd", auth.Middleware(sharedSecret, http.HandlerFunc(MergeCmdHandler)))
+	mux.Handle("POST /v1/session/open", auth.Middleware(sharedSecret, http.HandlerFunc(SessionOpenHandler)))
+	mux.Handle("POST /v1/session/close", auth.Middleware(sharedSecret, http.HandlerFunc(SessionCloseHandler)))
 	return mux
 }

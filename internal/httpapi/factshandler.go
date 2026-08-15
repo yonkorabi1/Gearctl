@@ -30,12 +30,18 @@ func FactsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	startedAt := time.Now()
+
+	if req.SessionID != "" {
+		runFactsOnSession(w, req.SessionID, startedAt)
+		return
+	}
+
 	if !security.IsAllowedOltTarget(req.Host) {
 		writeFactsValidationError(w, fmt.Sprintf("Target host %q is not allowed", req.Host))
 		return
 	}
 
-	startedAt := time.Now()
 	driver := drivers.Resolve(req.Vendor)
 
 	factsProvider, ok := driver.(drivers.FactsProvider)
@@ -71,6 +77,56 @@ func FactsHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, FactsResponse{
 			Status:          "failed",
 			Error:           toExecuteError(err),
+			TotalDurationMs: time.Since(startedAt).Milliseconds(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, FactsResponse{
+		Status:          "success",
+		Facts:           facts,
+		ConnectedAt:     &connectedAt,
+		TotalDurationMs: time.Since(startedAt).Milliseconds(),
+	})
+}
+
+// runFactsOnSession is FactsHandler's session-based path: instead of
+// resolving a vendor and dialing a fresh connection, it acquires an
+// already-open session from the pool and runs GetFacts() against its
+// existing driver -- see acquireSession's doc comment for the
+// lock/release contract.
+func runFactsOnSession(w http.ResponseWriter, sessionID string, startedAt time.Time) {
+	sess, sessErr := acquireSession(sessionID)
+	if sessErr != nil {
+		writeJSON(w, http.StatusOK, FactsResponse{
+			Status:          "failed",
+			Error:           sessErr,
+			TotalDurationMs: time.Since(startedAt).Milliseconds(),
+		})
+		return
+	}
+	defer sessionStore.Release(sess)
+
+	factsProvider, ok := sess.Driver.(drivers.FactsProvider)
+	if !ok {
+		writeJSON(w, http.StatusOK, FactsResponse{
+			Status: "failed",
+			Error: &ExecuteError{
+				Type:    "unsupported",
+				Message: fmt.Sprintf("vendor %q has no facts-capable driver", sess.Vendor),
+			},
+			TotalDurationMs: time.Since(startedAt).Milliseconds(),
+		})
+		return
+	}
+
+	connectedAt := sess.ConnectedAt.UTC().Format(time.RFC3339Nano)
+	facts, err := factsProvider.GetFacts()
+	if err != nil {
+		writeJSON(w, http.StatusOK, FactsResponse{
+			Status:          "failed",
+			Error:           toExecuteError(err),
+			ConnectedAt:     &connectedAt,
 			TotalDurationMs: time.Since(startedAt).Milliseconds(),
 		})
 		return

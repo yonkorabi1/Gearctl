@@ -3,9 +3,12 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/onu-platform/gearctl/internal/drivers"
 )
 
 func postLLDPNeighbors(t *testing.T, body string) (*httptest.ResponseRecorder, LLDPNeighborsResponse) {
@@ -78,6 +81,49 @@ func TestLLDPNeighborsHandlerReportsUnsupportedForVendorsWithoutLLDPProvider(t *
 	}
 	if resp.Neighbors != nil {
 		t.Errorf("got neighbors %v, want nil", resp.Neighbors)
+	}
+}
+
+func TestLLDPNeighborsHandlerSessionNotFound(t *testing.T) {
+	rec, resp := postLLDPNeighbors(t, `{"sessionId": "does-not-exist"}`)
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Error == nil || resp.Error.Type != "session_not_found" {
+		t.Errorf("got error %+v, want type=session_not_found", resp.Error)
+	}
+}
+
+func TestLLDPNeighborsHandlerSucceedsViaSession(t *testing.T) {
+	driver := &fakeSessionDriver{vendor: "cisco", neighbors: map[string][]drivers.LLDPNeighbor{
+		"Gi1": {{RemoteSystemName: "switch1", RemotePortID: "Gi0/1"}},
+	}}
+	sessionID := openFakeSession(driver, "cisco")
+	defer func() { _ = sessionStore.Close(sessionID) }()
+
+	rec, resp := postLLDPNeighbors(t, fmt.Sprintf(`{"sessionId": %q}`, sessionID))
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Status != "success" {
+		t.Errorf("got status %q, want \"success\" (error: %+v)", resp.Status, resp.Error)
+	}
+	if len(resp.Neighbors["Gi1"]) != 1 || resp.Neighbors["Gi1"][0].RemoteSystemName != "switch1" {
+		t.Errorf("got neighbors %+v, want Gi1 -> switch1", resp.Neighbors)
+	}
+}
+
+func TestLLDPNeighborsHandlerReportsUnsupportedViaSession(t *testing.T) {
+	driver := &drivers.RawDriver{}
+	sessionID := openFakeSession(driver, "huawei")
+	defer func() { _ = sessionStore.Close(sessionID) }()
+
+	rec, resp := postLLDPNeighbors(t, fmt.Sprintf(`{"sessionId": %q}`, sessionID))
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Error == nil || resp.Error.Type != "unsupported" {
+		t.Errorf("got error %+v, want type=unsupported", resp.Error)
 	}
 }
 

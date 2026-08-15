@@ -3,9 +3,12 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/onu-platform/gearctl/internal/drivers"
 )
 
 func postMergeCmd(t *testing.T, body string) (*httptest.ResponseRecorder, MergeConfigResponse) {
@@ -140,6 +143,50 @@ func TestMergeCmdHandlerReportsUnsupportedForVendorsWithoutConfigLoader(t *testi
 	}
 	if resp.Applied {
 		t.Error("applied = true, want false")
+	}
+}
+
+func TestMergeCmdHandlerSessionNotFound(t *testing.T) {
+	rec, resp := postMergeCmd(t, `{"sessionId": "does-not-exist", "commands": ["hostname R2"], "dryRun": true}`)
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Error == nil || resp.Error.Type != "session_not_found" {
+		t.Errorf("got error %+v, want type=session_not_found", resp.Error)
+	}
+}
+
+func TestMergeCmdHandlerSucceedsViaSession(t *testing.T) {
+	driver := &fakeSessionDriver{
+		vendor: "cisco", diff: "+hostname R2", configHash: "abc123",
+		reverseCommands: []string{"hostname R1"},
+	}
+	sessionID := openFakeSession(driver, "cisco")
+	defer func() { _ = sessionStore.Close(sessionID) }()
+
+	rec, resp := postMergeCmd(t, fmt.Sprintf(`{"sessionId": %q, "commands": ["hostname R2"], "dryRun": true}`, sessionID))
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Status != "success" {
+		t.Errorf("got status %q, want \"success\" (error: %+v)", resp.Status, resp.Error)
+	}
+	if len(resp.ReverseCommands) != 1 || resp.ReverseCommands[0] != "hostname R1" {
+		t.Errorf("got reverseCommands %v, want [\"hostname R1\"]", resp.ReverseCommands)
+	}
+}
+
+func TestMergeCmdHandlerReportsUnsupportedViaSession(t *testing.T) {
+	driver := &drivers.RawDriver{}
+	sessionID := openFakeSession(driver, "huawei")
+	defer func() { _ = sessionStore.Close(sessionID) }()
+
+	rec, resp := postMergeCmd(t, fmt.Sprintf(`{"sessionId": %q, "commands": ["hostname R2"], "dryRun": true}`, sessionID))
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Error == nil || resp.Error.Type != "unsupported" {
+		t.Errorf("got error %+v, want type=unsupported", resp.Error)
 	}
 }
 

@@ -3,9 +3,12 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/onu-platform/gearctl/internal/transport"
 )
 
 func postExecute(t *testing.T, body string) (*httptest.ResponseRecorder, ExecuteResponse) {
@@ -108,6 +111,48 @@ func TestExecuteHandlerBlocksDisallowedTarget(t *testing.T) {
 		t.Errorf("got error %+v, want type=validation", resp.Error)
 	}
 }
+
+func TestExecuteHandlerSessionNotFound(t *testing.T) {
+	rec, resp := postExecute(t, `{"sessionId": "does-not-exist", "commands": ["show version"]}`)
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Error == nil || resp.Error.Type != "session_not_found" {
+		t.Errorf("got error %+v, want type=session_not_found", resp.Error)
+	}
+}
+
+// TestExecuteHandlerSucceedsViaSession confirms the session path reaches
+// RunCommands() on the pooled driver and returns its result -- no
+// capability check the way facts/interfaces/etc. have (RunCommands is on
+// the base CliDriver interface every driver implements), so this is the
+// whole test.
+func TestExecuteHandlerSucceedsViaSession(t *testing.T) {
+	driver := &fakeSessionDriver{
+		vendor: "cisco",
+		runResults: []transport.CommandResult{
+			{Command: "show version", Output: strPtr("v1.0")},
+		},
+	}
+	sessionID := openFakeSession(driver, "cisco")
+	defer func() { _ = sessionStore.Close(sessionID) }()
+
+	rec, resp := postExecute(t, fmt.Sprintf(`{"sessionId": %q, "commands": ["show version"]}`, sessionID))
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Status != "success" {
+		t.Errorf("got status %q, want \"success\" (error: %+v)", resp.Status, resp.Error)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Output == nil || *resp.Results[0].Output != "v1.0" {
+		t.Errorf("got results %+v, want one result with output v1.0", resp.Results)
+	}
+	if driver.disconnectCount != 0 {
+		t.Error("a session-based call must never disconnect the pooled connection")
+	}
+}
+
+func strPtr(s string) *string { return &s }
 
 // TestExecuteHandlerReturnsFailedForConnectionError exercises the real
 // RawDriver/transport stack against 192.0.2.1 -- the TEST-NET-1 range

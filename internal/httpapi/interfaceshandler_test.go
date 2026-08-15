@@ -3,9 +3,12 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/onu-platform/gearctl/internal/drivers"
 )
 
 func postInterfaces(t *testing.T, body string) (*httptest.ResponseRecorder, InterfacesResponse) {
@@ -78,6 +81,52 @@ func TestInterfacesHandlerReportsUnsupportedForVendorsWithoutInterfaceProvider(t
 	}
 	if resp.Interfaces != nil {
 		t.Errorf("got interfaces %v, want nil", resp.Interfaces)
+	}
+}
+
+func TestInterfacesHandlerSessionNotFound(t *testing.T) {
+	rec, resp := postInterfaces(t, `{"sessionId": "does-not-exist"}`)
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Error == nil || resp.Error.Type != "session_not_found" {
+		t.Errorf("got error %+v, want type=session_not_found", resp.Error)
+	}
+}
+
+func TestInterfacesHandlerSucceedsViaSession(t *testing.T) {
+	driver := &fakeSessionDriver{vendor: "cisco", interfaces: map[string]drivers.InterfaceInfo{
+		"GigabitEthernet1": {IsUp: true},
+	}}
+	sessionID := openFakeSession(driver, "cisco")
+	defer func() { _ = sessionStore.Close(sessionID) }()
+
+	rec, resp := postInterfaces(t, fmt.Sprintf(`{"sessionId": %q}`, sessionID))
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Status != "success" {
+		t.Errorf("got status %q, want \"success\" (error: %+v)", resp.Status, resp.Error)
+	}
+	if !resp.Interfaces["GigabitEthernet1"].IsUp {
+		t.Errorf("got interfaces %+v, want GigabitEthernet1.IsUp=true", resp.Interfaces)
+	}
+	if driver.disconnectCount != 0 {
+		t.Error("a session-based call must never disconnect the pooled connection")
+	}
+}
+
+func TestInterfacesHandlerReportsUnsupportedViaSession(t *testing.T) {
+	driver := &drivers.RawDriver{}
+	sessionID := openFakeSession(driver, "huawei")
+	defer func() { _ = sessionStore.Close(sessionID) }()
+
+	rec, resp := postInterfaces(t, fmt.Sprintf(`{"sessionId": %q}`, sessionID))
+	if rec.Code != http.StatusOK {
+		t.Errorf("got status %d, want 200", rec.Code)
+	}
+	if resp.Error == nil || resp.Error.Type != "unsupported" {
+		t.Errorf("got error %+v, want type=unsupported", resp.Error)
 	}
 }
 
