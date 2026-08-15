@@ -17,7 +17,15 @@ import (
 type fakeShellSession struct {
 	responses map[string]fakeResponse
 	sent      []string
-	closed    bool
+	// hints records the expectedPrompt argument SendAndWaitForPromptHint
+	// was called with for each corresponding entry in sent (same index) --
+	// lets tests assert a caller actually predicted and passed a hint,
+	// not just that the command was sent. currentPrompt lets a test
+	// control what CurrentPrompt() reports, the same way responses
+	// controls what each command "returns".
+	hints         []string
+	currentPrompt string
+	closed        bool
 }
 
 type fakeResponse struct {
@@ -28,8 +36,13 @@ type fakeResponse struct {
 
 func (f *fakeShellSession) Open(transport.ConnectionParams) error { return nil }
 
-func (f *fakeShellSession) SendAndWaitForPrompt(command string, _ time.Duration) (string, bool, error) {
+func (f *fakeShellSession) SendAndWaitForPrompt(command string, timeout time.Duration) (string, bool, error) {
+	return f.SendAndWaitForPromptHint(command, timeout, "")
+}
+
+func (f *fakeShellSession) SendAndWaitForPromptHint(command string, _ time.Duration, expectedPrompt string) (string, bool, error) {
 	f.sent = append(f.sent, command)
+	f.hints = append(f.hints, expectedPrompt)
 	resp, ok := f.responses[command]
 	if !ok {
 		return "", false, nil
@@ -38,6 +51,10 @@ func (f *fakeShellSession) SendAndWaitForPrompt(command string, _ time.Duration)
 		return "", false, resp.err
 	}
 	return resp.output, resp.truncated, nil
+}
+
+func (f *fakeShellSession) CurrentPrompt() string {
+	return f.currentPrompt
 }
 
 func (f *fakeShellSession) Close() error {

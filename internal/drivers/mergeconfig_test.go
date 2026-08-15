@@ -143,6 +143,70 @@ func TestApplyMergeConfigHappyPath(t *testing.T) {
 	}
 }
 
+// TestPredictNextPrompt covers every mode-transition applyMergeConfig
+// actually sends -- see predictNextPrompt's doc comment for why "exit"
+// and plain child config lines are deliberately NOT among them (not
+// commands applyMergeConfig ever sends to leave a mode, and not commands
+// that change the prompt at all, respectively).
+func TestPredictNextPrompt(t *testing.T) {
+	cases := []struct {
+		name          string
+		currentPrompt string
+		cmd           string
+		want          string
+	}{
+		{"configure terminal from exec prompt", "ISR#", "configure terminal", "ISR(config)#"},
+		{"configure terminal is case-insensitive", "ISR#", "CONFIGURE TERMINAL", "ISR(config)#"},
+		{"interface opener from config prompt", "ISR(config)#", "interface GigabitEthernet1", "ISR(config-if)#"},
+		{"router opener from config prompt", "ISR(config)#", "router bgp 65000", "ISR(config-router)#"},
+		{"line opener from config prompt", "ISR(config)#", "line vty 0 4", "ISR(config-line)#"},
+		{"end returns to the exec prompt", "ISR(config-if)#", "end", "ISR#"},
+		{"plain child line has no prediction", "ISR(config-if)#", "description test", ""},
+		{"no-prefixed removal has no prediction", "ISR(config-if)#", "no shutdown", ""},
+		{"exit has no prediction (applyMergeConfig never sends it)", "ISR(config-if)#", "exit", ""},
+		{"empty current prompt yields no prediction", "", "configure terminal", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := predictNextPrompt(c.currentPrompt, c.cmd); got != c.want {
+				t.Errorf("predictNextPrompt(%q, %q) = %q, want %q", c.currentPrompt, c.cmd, got, c.want)
+			}
+		})
+	}
+}
+
+// TestApplyMergeConfigPassesPredictedPromptHints is the end-to-end
+// regression test for the fix motivated by the NAPALM comparison report:
+// without a hint, EVERY mode-transition command below would force
+// gearctl's full commandQuiescenceMs (2s) fallback wait, since the
+// session's own last-known prompt is guaranteed stale the instant such a
+// command is sent (see predictNextPrompt's and
+// SendAndWaitForPromptHint's doc comments). Asserts the ACTUAL hint
+// runSingle computed and passed down for each command in order --  not
+// just that the commands themselves were sent correctly (already covered
+// by TestApplyMergeConfigHappyPath).
+func TestApplyMergeConfigPassesPredictedPromptHints(t *testing.T) {
+	fake := &fakeShellSession{
+		responses:     map[string]fakeResponse{},
+		currentPrompt: "ISR#",
+	}
+	d := &CiscoIOSDriver{BaseDriver{session: fake, params: transport.ConnectionParams{PerCommandTimeoutMs: 1000}}}
+
+	lines := []string{"interface GigabitEthernet1", "description test"}
+	if _, _, err := d.applyMergeConfig(lines); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wantSent := []string{"configure terminal", "interface GigabitEthernet1", "description test", "end"}
+	wantHints := []string{"ISR(config)#", "ISR(config-if)#", "", "ISR#"}
+	if !reflect.DeepEqual(fake.sent, wantSent) {
+		t.Fatalf("sent = %v, want %v", fake.sent, wantSent)
+	}
+	if !reflect.DeepEqual(fake.hints, wantHints) {
+		t.Errorf("hints = %v, want %v (currentPrompt never advances in this fake, so every hint is predicted from the same fixed \"ISR#\" -- a real session's CurrentPrompt() would actually advance between calls, this just confirms runSingle computes and passes SOMETHING non-empty for every mode-transition command, and nothing for the plain child line)", fake.hints, wantHints)
+	}
+}
+
 func TestApplyMergeConfigStopsOnRejection(t *testing.T) {
 	fake := &fakeShellSession{responses: map[string]fakeResponse{
 		"bad line": {output: "% Invalid input detected at '^' marker."},

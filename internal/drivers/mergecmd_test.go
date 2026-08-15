@@ -200,6 +200,61 @@ end
 	}
 }
 
+// TestProjectMergedConfigNoRemovalUsesIPTwoTokenMatchKey is the
+// regression test for a real bug caught live (dogfooding gearctl's own
+// -merge-cmd against a real Cisco ISR to enable/disable "ip scp server
+// enable" for a NAPALM comparison): "no ip scp server enable"'s removal
+// match used to key on first-token ("ip") alone, so with more than one
+// global "ip ..." line present it could remove the WRONG one --
+// concretely, it removed "ip domain name isr.com" instead of "ip scp
+// server enable". The device only ever received the literal "no ip scp
+// server enable" command (apply never replays the projection, see
+// projectMergedConfig's doc comment), so this was a misleading-preview
+// bug, not an incorrect device write -- but a misleading diff for a
+// "review carefully before applying" feature is a real bug regardless.
+// Fixed by having "no <rest>" removal share matchKey (ip-prefix
+// two-token included) with the replace/add path, instead of a plainer
+// first-token-only key.
+func TestProjectMergedConfigNoRemovalUsesIPTwoTokenMatchKey(t *testing.T) {
+	current := `ip domain name isr.com
+ip scp server enable
+end
+`
+	projected, ops := projectMergedConfig(current, []string{"no ip scp server enable"})
+
+	if !strings.Contains(projected, "ip domain name isr.com") {
+		t.Errorf("wrongly removed \"ip domain name isr.com\" -- it should be untouched:\n%s", projected)
+	}
+	if strings.Contains(projected, "ip scp server enable") {
+		t.Errorf("\"ip scp server enable\" should have been removed:\n%s", projected)
+	}
+	if len(ops) != 1 || ops[0].kind != "remove" || ops[0].previousLine != "ip scp server enable" {
+		t.Errorf("ops = %#v, want a single remove of \"ip scp server enable\"", ops)
+	}
+}
+
+// TestProjectMergedConfigNoRemovalUsesIPTwoTokenMatchKeyWithinStanza is
+// the same regression, at stanza scope (applyStanzaCommand) rather than
+// global scope (applyGlobalCommand) -- both call sites had the bug and
+// both needed the fix.
+func TestProjectMergedConfigNoRemovalUsesIPTwoTokenMatchKeyWithinStanza(t *testing.T) {
+	current := `interface GigabitEthernet1
+ ip address 10.0.0.1 255.255.255.0
+ ip helper-address 10.0.0.5
+!
+end
+`
+	projected, _ := projectMergedConfig(current, []string{
+		"interface GigabitEthernet1", "no ip helper-address 10.0.0.5",
+	})
+	if !strings.Contains(projected, "ip address 10.0.0.1 255.255.255.0") {
+		t.Errorf("wrongly removed \"ip address\" -- it should be untouched:\n%s", projected)
+	}
+	if strings.Contains(projected, "ip helper-address") {
+		t.Errorf("\"ip helper-address\" should have been removed:\n%s", projected)
+	}
+}
+
 // TestProjectMergedConfigSwitchesInterfaceContextWithoutExit is a required
 // case from the design review: two "interface X" openers back to back
 // with no "exit" between them must each attribute their following lines

@@ -62,6 +62,101 @@ func TestStreamShellSessionTracksPromptAcrossModeChange(t *testing.T) {
 	}
 }
 
+// TestStreamShellSessionHintAvoidsQuiescenceFallbackOnModeChange is the
+// speed counterpart to TestStreamShellSessionTracksPromptAcrossModeChange
+// above: that test proves prompt-tracking is CORRECT across a mode
+// change, at the cost of paying commandQuiescenceMs (2s) to discover the
+// new prompt, since a plain SendAndWaitForPrompt call has no way to know
+// the mode-changing command's own upcoming prompt in advance. This test
+// proves a caller that CAN predict it (a driver with vendor prompt-
+// grammar knowledge -- see CiscoIOSDriver's predictNextPrompt) gets the
+// same correct result via SendAndWaitForPromptHint, but through the
+// normal fast substring-match path instead -- the real, measured
+// motivation being gearctl's -merge-cmd apply path (config
+// mode/interface/router/line transitions), see the NAPALM comparison
+// report in gearctl's README.
+func TestStreamShellSessionHintAvoidsQuiescenceFallbackOnModeChange(t *testing.T) {
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		switch {
+		case written == crlf:
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("\r\n\r\nOLT>")
+			}()
+		case strings.Contains(written, "config"):
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("config\r\nEntering configuration mode\r\nOLT(config)#")
+			}()
+		}
+	})
+
+	session := NewStreamShellSession(source, func() error { return nil })
+	if err := session.Open(ConnectionParams{ConnectTimeoutMs: 2000}); err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	started := time.Now()
+	out, _, err := session.SendAndWaitForPromptHint("config", 3*time.Second, "OLT(config)#")
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("\"config\" command failed: %v", err)
+	}
+	if out != "Entering configuration mode" {
+		t.Errorf("got output %q, want %q", out, "Entering configuration mode")
+	}
+	// commandQuiescenceMs is 2000ms -- a correct hint should complete in
+	// roughly the scripted 10ms response delay, nowhere near that. 1
+	// second gives generous slack for CI/container scheduling jitter
+	// while still failing loudly if this silently regresses back to the
+	// quiescence fallback.
+	if elapsed >= time.Second {
+		t.Errorf("took %v with a correct hint -- want well under commandQuiescenceMs (2s), the fallback this hint exists to avoid", elapsed)
+	}
+	if got := session.CurrentPrompt(); got != "OLT(config)#" {
+		t.Errorf("CurrentPrompt() = %q, want %q", got, "OLT(config)#")
+	}
+}
+
+// TestStreamShellSessionWrongHintStillSelfCorrectsViaQuiescence confirms
+// SendAndWaitForPromptHint's safety net: a WRONG guess must never produce
+// a wrong result, only a slower one -- the same quiescence fallback
+// TestStreamShellSessionTracksPromptAcrossModeChange already exercises
+// with no hint at all fires here too, and still lands on the device's
+// real prompt, not the incorrect guess.
+func TestStreamShellSessionWrongHintStillSelfCorrectsViaQuiescence(t *testing.T) {
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		switch {
+		case written == crlf:
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("\r\n\r\nOLT>")
+			}()
+		case strings.Contains(written, "config"):
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("config\r\nEntering configuration mode\r\nOLT(config)#")
+			}()
+		}
+	})
+
+	session := NewStreamShellSession(source, func() error { return nil })
+	if err := session.Open(ConnectionParams{ConnectTimeoutMs: 2000}); err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	out, _, err := session.SendAndWaitForPromptHint("config", 3*time.Second, "OLT(config-if)#")
+	if err != nil {
+		t.Fatalf("\"config\" command failed: %v", err)
+	}
+	if out != "Entering configuration mode" {
+		t.Errorf("got output %q, want %q (a wrong hint must still resolve to the device's REAL output/prompt via the quiescence fallback, not the guessed one)", out, "Entering configuration mode")
+	}
+	if got := session.CurrentPrompt(); got != "OLT(config)#" {
+		t.Errorf("CurrentPrompt() = %q, want %q (the device's actual prompt, not the wrong guess \"OLT(config-if)#\")", got, "OLT(config)#")
+	}
+}
+
 // TestStreamShellSessionCarriesResidualBytesBetweenCommands is the
 // end-to-end regression test for the real-hardware finding that
 // motivated carry-forward in the first place: a low-output command (e.g.

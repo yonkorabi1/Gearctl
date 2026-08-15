@@ -24,6 +24,35 @@ type ShellSession interface {
 	// its state is indeterminate.
 	SendAndWaitForPrompt(command string, timeout time.Duration) (output string, truncated bool, err error)
 
+	// SendAndWaitForPromptHint is SendAndWaitForPrompt, but the caller
+	// supplies expectedPrompt -- the prompt to search for -- instead of
+	// letting the session assume its own last-known prompt is still
+	// current. Pass "" to get SendAndWaitForPrompt's exact behavior
+	// (search for the session's own last-known prompt); SendAndWaitForPrompt
+	// is defined in terms of this method for that reason.
+	//
+	// For a command KNOWN to change the prompt (Cisco's "configure
+	// terminal"/"interface X"/"end", say), the session's last-known prompt
+	// is guaranteed stale, so a caller with no hint pays waitForPrompt's
+	// full commandQuiescenceMs fallback wait every single time -- a real,
+	// measured cost (see gearctl's README, the NAPALM comparison report).
+	// A caller that can predict the new prompt (a driver with vendor
+	// knowledge of its own CLI grammar -- this interface has none) can
+	// pass it here and get the same fast substring-match path a
+	// steady-prompt command already gets. A wrong guess is never unsafe:
+	// waitForPrompt's quiescence fallback still fires and self-corrects
+	// exactly as if no hint had been given at all, just without the
+	// speedup.
+	SendAndWaitForPromptHint(command string, timeout time.Duration, expectedPrompt string) (output string, truncated bool, err error)
+
+	// CurrentPrompt returns the session's own last-known prompt text --
+	// what SendAndWaitForPrompt would search for right now. Read-only;
+	// exists so a caller building a SendAndWaitForPromptHint prediction
+	// (e.g. deriving a hostname to build "hostname(config)#") has
+	// something real to derive it from, without this package needing any
+	// vendor-specific prompt-grammar knowledge of its own.
+	CurrentPrompt() string
+
 	// Close tears down the connection. Safe to call multiple times.
 	Close() error
 }
@@ -114,10 +143,18 @@ func (s *StreamShellSession) Open(params ConnectionParams) error {
 }
 
 func (s *StreamShellSession) SendAndWaitForPrompt(command string, timeout time.Duration) (string, bool, error) {
+	return s.SendAndWaitForPromptHint(command, timeout, "")
+}
+
+func (s *StreamShellSession) SendAndWaitForPromptHint(command string, timeout time.Duration, expectedPrompt string) (string, bool, error) {
 	if s.closed {
 		return "", false, olterr.New(olterr.TypeProtocol, "Cannot send a command on a closed session")
 	}
-	output, nextPrompt, newCarry, err := waitForPrompt(s.source, command, s.promptText, s.carry, timeout)
+	searchPrompt := expectedPrompt
+	if searchPrompt == "" {
+		searchPrompt = s.promptText
+	}
+	output, nextPrompt, newCarry, err := waitForPrompt(s.source, command, searchPrompt, s.carry, timeout)
 	if err != nil {
 		return "", false, err
 	}
@@ -126,13 +163,20 @@ func (s *StreamShellSession) SendAndWaitForPrompt(command string, timeout time.D
 	// (e.g. entering a config/privileged mode), and the next command needs
 	// to match against whatever the prompt actually is NOW. carry is
 	// threaded the same way, for the same reason -- see StreamShellSession's
-	// doc comment on the carry field.
+	// doc comment on the carry field. This holds regardless of whether
+	// searchPrompt came from a hint or from s.promptText itself -- either
+	// way, nextPrompt is what waitForPrompt actually observed, never just
+	// an echo of what was searched for.
 	s.promptText = nextPrompt
 	s.carry = newCarry
 	if len(output) > MaxOutputBytes {
 		return truncateUTF8(output, MaxOutputBytes), true, nil
 	}
 	return output, false, nil
+}
+
+func (s *StreamShellSession) CurrentPrompt() string {
+	return s.promptText
 }
 
 // attemptEnable sends the literal command "enable" and inspects what

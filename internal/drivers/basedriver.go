@@ -80,6 +80,67 @@ func (d *BaseDriver) RunCommands(commands []string) ([]transport.CommandResult, 
 	return results, nil
 }
 
+// CurrentPrompt returns the session's own last-known prompt text, or ""
+// if Connect hasn't been called yet. Exists so a driver can build a
+// SendAndWaitForPromptHint prediction (via RunCommandWithHint below) from
+// something real -- see ShellSession.CurrentPrompt's doc comment.
+func (d *BaseDriver) CurrentPrompt() string {
+	if d.session == nil {
+		return ""
+	}
+	return d.session.CurrentPrompt()
+}
+
+// RunCommandWithHint is RunCommands for exactly one command, but lets the
+// caller supply expectedPrompt -- see
+// ShellSession.SendAndWaitForPromptHint's doc comment for why: a command
+// known to change the device's prompt (Cisco's "configure terminal"/
+// "interface X"/"end", say) would otherwise pay a guaranteed
+// commandQuiescenceMs fallback wait every time, since the session's own
+// last-known prompt is guaranteed stale the instant such a command is
+// sent. A wrong guess is never unsafe, just not faster -- same fallback
+// self-correction as passing no hint at all.
+//
+// Same fail-fast-on-timeout error classing as RunCommands, just for one
+// command instead of a list -- used directly by CiscoIOSDriver's
+// applyMergeConfig, which already runs one command at a time for its own
+// reasons (see its doc comment) and is the one caller in this codebase
+// that both knows a vendor's prompt grammar well enough to predict with,
+// and cares about the resulting speedup.
+func (d *BaseDriver) RunCommandWithHint(command, expectedPrompt string) (transport.CommandResult, error) {
+	if d.session == nil {
+		return transport.CommandResult{}, olterr.New(olterr.TypeProtocol, "RunCommandWithHint() called before Connect()")
+	}
+
+	startedAt := time.Now()
+	output, truncated, err := d.session.SendAndWaitForPromptHint(
+		command,
+		time.Duration(d.params.PerCommandTimeoutMs)*time.Millisecond,
+		expectedPrompt,
+	)
+	if err != nil {
+		errClass := "session_closed"
+		if cliErr, ok := err.(*olterr.OltCliError); ok && cliErr.ErrType == olterr.TypeTimeout {
+			errClass = "timeout"
+		}
+		return transport.CommandResult{
+			Command:    command,
+			Output:     nil,
+			DurationMs: time.Since(startedAt).Milliseconds(),
+			Truncated:  false,
+			Error:      errClass,
+		}, nil
+	}
+
+	out := output
+	return transport.CommandResult{
+		Command:    command,
+		Output:     &out,
+		DurationMs: time.Since(startedAt).Milliseconds(),
+		Truncated:  truncated,
+	}, nil
+}
+
 func (d *BaseDriver) Disconnect() error {
 	if d.session == nil {
 		return nil

@@ -522,23 +522,79 @@ func detectRejection(result transport.CommandResult) string {
 	return ""
 }
 
+// predictNextPrompt guesses the Cisco prompt that sending cmd will
+// produce, given the device's prompt right now is currentPrompt -- for
+// the small set of mode-transition commands applyMergeConfig actually
+// sends: "configure terminal", an interface/router/line context opener,
+// and "end". Returns "" (no prediction) for anything else, including a
+// context-less "no <cmd>", any child config line, or "exit" (which pops
+// back to a stack depth this function doesn't track -- "end" is what
+// applyMergeConfig actually uses to leave config mode, see its own doc
+// comment, so not predicting "exit" costs nothing in practice).
+//
+// This exists purely as a speed optimization (see
+// RunCommandWithHint/SendAndWaitForPromptHint's doc comments) -- a wrong
+// guess is never unsafe, it just falls back to gearctl's normal
+// commandQuiescenceMs wait exactly as if no hint had been given.
+// Confirmed live against a real Cisco ISRv (IOS-XE 17.01.01) for every
+// transition this function predicts.
+//
+// Derives the hostname from currentPrompt by stripping the last
+// parenthesised mode suffix (if any) and the trailing "#"/">" --
+// e.g. "ISR#" -> "ISR", "ISR(config)#" -> "ISR". This assumes Cisco's own
+// prompt convention (hostname, optional "(modename)", then "#" in
+// privileged/config mode) holds, which is the same assumption
+// promptdetector.go's quiescence-fallback path already makes when
+// guessing a settled prompt -- not a new dependency this introduces.
+func predictNextPrompt(currentPrompt, cmd string) string {
+	if currentPrompt == "" {
+		return ""
+	}
+	hostname := currentPrompt
+	if idx := strings.LastIndex(hostname, "("); idx != -1 {
+		hostname = hostname[:idx]
+	}
+	hostname = strings.TrimRight(hostname, "#> ")
+	if hostname == "" {
+		return ""
+	}
+
+	switch {
+	case strings.EqualFold(cmd, "configure terminal"):
+		return hostname + "(config)#"
+	case strings.EqualFold(cmd, "end"):
+		return hostname + "#"
+	case strings.HasPrefix(cmd, "interface "):
+		return hostname + "(config-if)#"
+	case strings.HasPrefix(cmd, "router "):
+		return hostname + "(config-router)#"
+	case strings.HasPrefix(cmd, "line "):
+		return hostname + "(config-line)#"
+	default:
+		return ""
+	}
+}
+
 // runSingle runs exactly one command and returns its CommandResult.
-// Deliberately one RunCommands([]string{command}) call at a time, NOT one
-// batched multi-command call -- BaseDriver.RunCommands only stops early
-// on a transport-level failure, it does not inspect Output for a Cisco
+// Deliberately one command at a time, NOT one batched multi-command
+// RunCommands call -- BaseDriver.RunCommands only stops early on a
+// transport-level failure, it does not inspect Output for a Cisco
 // rejection, so a batched call would send every subsequent line
 // regardless of an earlier rejection. Calling one at a time from
 // applyMergeConfig's loop, checking each result before sending the next,
 // is what makes fail-fast on rejection actually fail fast on the wire.
+//
+// Predicts the next prompt via predictNextPrompt and passes it as a hint
+// to RunCommandWithHint -- see predictNextPrompt's and
+// SendAndWaitForPromptHint's doc comments for why: applyMergeConfig's
+// "configure terminal"/context-opener/"end" commands each change the
+// device's prompt, and without a hint that's a guaranteed
+// commandQuiescenceMs (2s) wait on every single one of them (confirmed
+// live -- see gearctl's README, the NAPALM comparison report, for the
+// benchmark that surfaced this).
 func (d *CiscoIOSDriver) runSingle(command string) (transport.CommandResult, error) {
-	results, err := d.RunCommands([]string{command})
-	if err != nil {
-		return transport.CommandResult{}, err
-	}
-	if len(results) < 1 {
-		return transport.CommandResult{}, olterr.New(olterr.TypeProtocol, "no result returned for command "+command)
-	}
-	return results[0], nil
+	hint := predictNextPrompt(d.CurrentPrompt(), command)
+	return d.RunCommandWithHint(command, hint)
 }
 
 // applyMergeConfig enters config mode, replays lines one at a time
@@ -799,19 +855,6 @@ func matchKey(line string) string {
 	return strings.ToLower(fields[0])
 }
 
-// firstToken returns just the first whitespace-delimited token, or "" for
-// an empty string -- used for "no <rest>" removal matching (§3 of the
-// design), which is deliberately looser than matchKey's ip-prefix special
-// case: Cisco's "no" convention is general enough that first-token-only
-// is the right granularity for "what is this undoing".
-func firstToken(s string) string {
-	fields := strings.Fields(s)
-	if len(fields) == 0 {
-		return ""
-	}
-	return fields[0]
-}
-
 // mergeOperation records what one delta command actually did to the
 // projection, so reverseCommands (below) can derive an undo command from
 // it -- kind is one of "replace"/"add"/"remove"/"no-op", appliedLine is
@@ -855,9 +898,16 @@ type mergeOperation struct {
 // switch e.g. "interface GigabitEthernet1" straight to "interface
 // GigabitEthernet2" with no "exit" in between); "exit"/"end" pop back to
 // global. For every other line: a "no <rest>" line removes an existing
-// line in the current context whose first token matches <rest>'s first
-// token, if one exists (Cisco's general undo convention, not a curated
-// per-command list); anything else looks for an existing line in the
+// line in the current context sharing <rest>'s matchKey, if one exists
+// (Cisco's general undo convention, not a curated per-command list) --
+// this is the SAME matchKey the replace/add path below uses (including
+// its ip-prefix two-token special case), not a plainer first-token-only
+// match: a live-hardware finding caught exactly the bug that asymmetry
+// caused -- "no ip scp server enable" matching first-token "ip" alone
+// wrongly matched an unrelated "ip domain name ..." line instead of the
+// "ip scp server enable" line actually being undone (see
+// TestApplyGlobalCommandNoRemovalUsesIPTwoTokenMatchKey); anything else
+// looks for an existing line in the
 // current context sharing the same matchKey and REPLACES it in place
 // (preserving position, so the diff shows a clean adjacent -old/+new
 // pair) if found, or INSERTS as a new line -- right after the context's
@@ -933,10 +983,10 @@ func projectMergedConfig(current string, commands []string) (string, []mergeOper
 // set it, unlike applyStanzaCommand's).
 func applyGlobalCommand(lines []string, globalLineIdxs []int, cmd string) ([]string, mergeOperation) {
 	if rest, isNo := strings.CutPrefix(cmd, "no "); isNo {
-		key := firstToken(rest)
+		key := matchKey(rest)
 		for _, idx := range globalLineIdxs {
 			line := strings.TrimSpace(lines[idx])
-			if strings.EqualFold(firstToken(line), key) {
+			if matchKey(line) == key {
 				return append(lines[:idx], lines[idx+1:]...), mergeOperation{kind: "remove", appliedLine: cmd, previousLine: line}
 			}
 		}
@@ -958,7 +1008,7 @@ func applyGlobalCommand(lines []string, globalLineIdxs []int, cmd string) ([]str
 // [rng.bodyStart, rng.bodyEnd) only -- the header line itself, and
 // everything outside this range (before or after the stanza, in any
 // other stanza), is never touched. "no <rest>" removes a matching
-// existing child line by first token; anything else replaces an
+// existing child line sharing <rest>'s matchKey; anything else replaces an
 // existing child line sharing the same matchKey in place, or is
 // inserted as a new child line (indented by one space, matching Cisco's
 // own convention) right after the stanza's last existing child -- or
@@ -969,10 +1019,10 @@ func applyGlobalCommand(lines []string, globalLineIdxs []int, cmd string) ([]str
 // stanza's context this call was made for.
 func applyStanzaCommand(lines []string, rng stanzaRange, cmd string) ([]string, mergeOperation) {
 	if rest, isNo := strings.CutPrefix(cmd, "no "); isNo {
-		key := firstToken(rest)
+		key := matchKey(rest)
 		for i := rng.bodyStart; i < rng.bodyEnd; i++ {
 			line := strings.TrimSpace(lines[i])
-			if strings.EqualFold(firstToken(line), key) {
+			if matchKey(line) == key {
 				return append(lines[:i], lines[i+1:]...), mergeOperation{kind: "remove", appliedLine: cmd, previousLine: line}
 			}
 		}
