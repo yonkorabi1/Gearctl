@@ -1,9 +1,12 @@
-// Package auth implements service-to-service authentication: platform-api
-// sends the same static secret (OLT_GATEWAY_SHARED_SECRET) in every
-// request. This is a private, internal-network-only service (no `ports:`
-// mapping in compose), but every request is still authenticated to
-// prevent lateral movement if another container on the same network were
-// compromised.
+// Package auth implements service-to-service authentication: a caller
+// sends the same static secret (gearctl's own config reads it as
+// GEARCTL_SHARED_SECRET -- see internal/config/config.go; platform-api's
+// client-side config still calls its copy of the same value
+// OLT_GATEWAY_SHARED_SECRET, its own naming, unrelated to gearctl's) in
+// every request. When gearctl runs as a private, internal-network-only
+// service (no `ports:` mapping in compose), every request is still
+// authenticated to prevent lateral movement if another container on the
+// same network were compromised.
 package auth
 
 import (

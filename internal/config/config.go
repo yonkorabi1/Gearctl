@@ -13,9 +13,9 @@ type Config struct {
 }
 
 func Load() (Config, error) {
-	secret := os.Getenv("OLT_GATEWAY_SHARED_SECRET")
+	secret := os.Getenv("GEARCTL_SHARED_SECRET")
 	if secret == "" {
-		return Config{}, fmt.Errorf("missing required env var OLT_GATEWAY_SHARED_SECRET")
+		return Config{}, fmt.Errorf("missing required env var GEARCTL_SHARED_SECRET")
 	}
 
 	port := 8090

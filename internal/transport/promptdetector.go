@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/onu-platform/olt-cli-gateway/internal/olterr"
+	"github.com/onu-platform/gearctl/internal/olterr"
 )
 
 const defaultQuiescenceMs = 300
@@ -47,12 +47,15 @@ var paginationMarkerPattern = regexp.MustCompile(`(?i)-{2,}\s*more\s*-{2,}|\(\s*
 // command, this isn't a line to submit, just a single keypress).
 const paginationContinueKeystroke = " "
 
-// waitForQuiescence accumulates bytes from source until no new data has
-// arrived for quiescenceMs, or maxWait elapses (safety cap for a device
-// that never goes quiet -- e.g. a broken/chatty CLI). Returns everything
-// accumulated.
-func waitForQuiescence(source *DataSource, quiescence, maxWait time.Duration) string {
+// waitForQuiescence accumulates bytes from source (seeded with carry, any
+// bytes already read out of the channel by an earlier call but not yet
+// consumed -- see waitForPrompt's doc comment for why that carry-forward
+// exists) until no new data has arrived for quiescenceMs, or maxWait
+// elapses (safety cap for a device that never goes quiet -- e.g. a
+// broken/chatty CLI). Returns everything accumulated, carry included.
+func waitForQuiescence(source *DataSource, carry string, quiescence, maxWait time.Duration) string {
 	var buffer strings.Builder
+	buffer.WriteString(carry)
 	quietTimer := time.NewTimer(quiescence)
 	defer quietTimer.Stop()
 	maxTimer := time.NewTimer(maxWait)
@@ -82,14 +85,20 @@ func waitForQuiescence(source *DataSource, quiescence, maxWait time.Duration) st
 
 // capturePrompt sends a bare newline, waits for quiescence, and treats the
 // last non-empty line of whatever came back as the shell's idle prompt.
+// carry seeds the buffer with any bytes an earlier call already read out
+// of the channel but didn't consume (e.g. leftover from an "enable"
+// exchange right before a password prompt) -- pass "" if there's nothing
+// to carry in, such as the very first call right after connecting.
+// capturePrompt always fully drains until genuinely quiet, so it never
+// has anything of its own left over to hand back as an outgoing carry.
 // Trimmed of surrounding whitespace only -- deliberately NOT regex-escaped/
 // interpreted here; matching in waitForPrompt below is a plain substring
 // check.
-func capturePrompt(source *DataSource, maxWaitMs int) (string, error) {
+func capturePrompt(source *DataSource, carry string, maxWaitMs int) (string, error) {
 	if err := source.Write(crlf); err != nil {
 		return "", olterr.New(olterr.TypeConnection, "failed to write to session: "+err.Error())
 	}
-	settled := waitForQuiescence(source, defaultQuiescenceMs*time.Millisecond, time.Duration(maxWaitMs)*time.Millisecond)
+	settled := waitForQuiescence(source, carry, defaultQuiescenceMs*time.Millisecond, time.Duration(maxWaitMs)*time.Millisecond)
 
 	prompt := lastPromptLikeLine(settled)
 	if prompt == "" {
@@ -153,35 +162,136 @@ func lastPromptLikeLine(text string) string {
 	return lastAny
 }
 
-// waitForPrompt sends `command`, then accumulates output until the buffer's
-// tail contains `promptText` (the previously captured prompt), or the
+// findEchoEnd returns the index just after command's first occurrence in
+// buffer[searchFrom:], in absolute buffer coordinates -- or -1 if not
+// found. searchFrom is always the position where THIS call's own newly-
+// arrived bytes begin (i.e. never inside carry, bytes an earlier call
+// already read but didn't consume) -- so stale residual data can never be
+// mistaken for this command's own echo. Only bytes that arrived after we
+// actually wrote this specific command can be.
+func findEchoEnd(buffer, command string, searchFrom int) int {
+	if searchFrom > len(buffer) {
+		return -1
+	}
+	idx := strings.Index(buffer[searchFrom:], command)
+	if idx == -1 {
+		return -1
+	}
+	return searchFrom + idx + len(command)
+}
+
+// cleanOutput trims the one leading and one trailing line-ending artifact
+// immediately around real command output, and strips any pagination-
+// marker lines a paginated response left in the middle of the text (see
+// waitForPrompt's pagination handling -- accumulated across page
+// continuations, a marker line sits at each page boundary, not just at
+// the very end).
+func cleanOutput(text string) string {
+	text = strings.TrimPrefix(text, "\r\n")
+	text = strings.TrimPrefix(text, "\n")
+	text = strings.TrimSuffix(text, "\r\n")
+	text = strings.TrimSuffix(text, "\n")
+	return stripPaginationMarkerLines(text)
+}
+
+// stripTrailingPromptOccurrence removes prompt from the end of text, and
+// keeps removing while what remains (after discarding only trailing
+// line-ending whitespace) still ends with prompt too. Used only by
+// waitForPrompt's quiescence-fallback path (see below) -- the substring-
+// match path never needs this, since it locates the prompt by exact
+// index and simply slices around it, with anything genuinely left over
+// afterward carried forward to the next call rather than needing to be
+// found-and-stripped here. The fallback path has no such carry-forward
+// boundary (by the time it fires, the device has gone fully quiet for
+// commandQuiescenceMs -- there's nothing further to carry), so a device
+// that redraws its own prompt twice in the same settled burst needs this
+// repeat-collapsing to avoid leaving the inner occurrence embedded in the
+// returned text as if it were real content.
+func stripTrailingPromptOccurrence(text, prompt string) string {
+	for {
+		idx := strings.LastIndex(text, prompt)
+		if idx == -1 {
+			return text
+		}
+		text = text[:idx]
+		trimmed := strings.TrimRight(text, "\r\n")
+		if !strings.HasSuffix(trimmed, prompt) {
+			return text
+		}
+		text = trimmed
+	}
+}
+
+// waitForPrompt sends `command`, then accumulates output until the
+// buffer (past this command's own echo) contains `promptText`, or the
 // output goes quiet for commandQuiescenceMs without ever matching it, or
-// the overall timeout elapses. On success, returns the output (leading
-// echoed command line and trailing prompt occurrence stripped) plus the
+// the overall timeout elapses. On success, returns the output, the
 // prompt to use for the NEXT command -- normally just promptText again,
 // but re-derived from the settled output's own trailing line when the
-// quiescence fallback fired instead of a substring match.
+// quiescence fallback fired instead of a substring match -- and newCarry:
+// any bytes read past the matched prompt in the SAME read that produced
+// the match, to be threaded into the next call's `carry` parameter.
 //
-// The fallback matters because this driver has no vendor knowledge of
-// privilege/mode levels: confirmed live against a real OLT, entering
-// config mode changes the prompt itself (e.g. "OLT>" -> "OLT(config)#"),
-// so the previously-captured prompt never reappears and a pure substring
-// match would time out on every mode-changing command even though the
-// device responded fine. Deliberately a much longer quiescence window
-// than the initial connect-time prompt capture (commandQuiescenceMs vs.
-// defaultQuiescenceMs) -- a real command's output can have brief pauses
-// mid-stream (e.g. a "show" enumerating many ONUs) that would otherwise
-// look like premature completion.
+// carry seeds this call's buffer with whatever the PREVIOUS call
+// returned as its own newCarry -- pass "" for the first command on a
+// fresh session. Bytes are only ever consumed from a channel once, so
+// anything read but not returned as output or carry is gone for good;
+// threading carry through is what keeps that from happening.
+//
+// Echo-gating + carry-forward (ported from Netmiko's read-buffer
+// approach, itself refined over years of exactly this class of bug) is
+// what this replaced: a real-hardware finding against a live Cisco ISR
+// showed a command with essentially no real output (e.g. "terminal
+// length 0") followed by a few stray trailing bytes (a duplicate prompt
+// redraw was the observed case) landing in the SAME read as its own
+// completion. An earlier fix drained and discarded those bytes with an
+// explicit ~300ms wait after every single command -- correct, but a real
+// per-command latency tax with no principled way to shrink it further.
+// This version has none of that: findEchoEnd locates THIS command's own
+// echo only within bytes that arrived after it was written (never inside
+// carry, so stale residue can never be mistaken for it), the prompt is
+// searched for only after that point, and anything past the match is
+// returned as newCarry rather than waited-out-then-thrown-away. Zero
+// added latency in the common case, and nothing is ever silently
+// dropped. See TestWaitForPromptCarriesResidualBytesToNextCall and
+// TestStreamShellSessionCarriesResidualBytesBetweenCommands.
+//
+// Trade-off accepted deliberately (matching Netmiko's own re.search
+// semantics, not a regression introduced here): the FIRST occurrence of
+// promptText after the echo is treated as completion, not the last. If a
+// command's real output happened to legitimately contain the exact
+// prompt substring mid-stream before actually finishing, this would cut
+// early -- an extremely unlikely, never-observed-live shape for a real
+// prompt string to appear in real output, and not a case a fast, no-wait
+// design can distinguish from genuine completion without adding back the
+// exact latency this change removes.
+//
+// The quiescence fallback matters because this driver has no vendor
+// knowledge of privilege/mode levels: confirmed live against a real OLT,
+// entering config mode changes the prompt itself (e.g. "OLT>" ->
+// "OLT(config)#"), so the previously-captured prompt never reappears and
+// a pure substring match would time out on every mode-changing command
+// even though the device responded fine. Deliberately a much longer
+// quiescence window than the initial connect-time prompt capture
+// (commandQuiescenceMs vs. defaultQuiescenceMs) -- a real command's
+// output can have brief pauses mid-stream (e.g. a "show" enumerating many
+// ONUs) that would otherwise look like premature completion.
 //
 // On timeout, returns an olterr.OltCliError with Type "timeout" -- the
 // caller MUST treat the session as unusable afterward (see ShellSession's
 // contract).
-func waitForPrompt(source *DataSource, command, promptText string, timeout time.Duration) (output string, nextPrompt string, err error) {
+func waitForPrompt(
+	source *DataSource, command, promptText, carry string, timeout time.Duration,
+) (output string, nextPrompt string, newCarry string, err error) {
 	if err := source.Write(command + crlf); err != nil {
-		return "", "", olterr.New(olterr.TypeConnection, "failed to write to session: "+err.Error())
+		return "", "", "", olterr.New(olterr.TypeConnection, "failed to write to session: "+err.Error())
 	}
 
 	var buffer strings.Builder
+	buffer.WriteString(carry)
+	newDataStart := len(carry)
+	echoEnd := -1
+
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	quietTimer := time.NewTimer(commandQuiescenceMs * time.Millisecond)
@@ -191,12 +301,22 @@ func waitForPrompt(source *DataSource, command, promptText string, timeout time.
 		select {
 		case chunk, ok := <-source.Chunks:
 			if !ok {
-				return "", "", olterr.New(olterr.TypeProtocol, "session closed while waiting for prompt after \""+command+"\"")
+				return "", "", "", olterr.New(olterr.TypeProtocol, "session closed while waiting for prompt after \""+command+"\"")
 			}
 			buffer.Write(chunk)
-			if strings.Contains(buffer.String(), promptText) {
-				return stripEchoAndPrompt(buffer.String(), command, promptText), promptText, nil
+			full := buffer.String()
+
+			if echoEnd == -1 {
+				echoEnd = findEchoEnd(full, command, newDataStart)
 			}
+			if echoEnd != -1 {
+				if idx := strings.Index(full[echoEnd:], promptText); idx != -1 {
+					matchStart := echoEnd + idx
+					matchEnd := matchStart + len(promptText)
+					return cleanOutput(full[echoEnd:matchStart]), promptText, full[matchEnd:], nil
+				}
+			}
+
 			if !quietTimer.Stop() {
 				select {
 				case <-quietTimer.C:
@@ -205,7 +325,12 @@ func waitForPrompt(source *DataSource, command, promptText string, timeout time.
 			}
 			quietTimer.Reset(commandQuiescenceMs * time.Millisecond)
 		case <-quietTimer.C:
-			settled := buffer.String()
+			full := buffer.String()
+			settledFrom := newDataStart
+			if echoEnd != -1 {
+				settledFrom = echoEnd
+			}
+			settled := full[settledFrom:]
 			if settled == "" {
 				// Nothing at all has arrived yet -- not truly quiet, the
 				// device just hasn't started responding. Keep waiting for
@@ -222,7 +347,7 @@ func waitForPrompt(source *DataSource, command, promptText string, timeout time.
 				// away as) a new prompt -- the operator just saw a
 				// partial table with no indication anything was missing.
 				if err := source.Write(paginationContinueKeystroke); err != nil {
-					return "", "", olterr.New(olterr.TypeConnection, "failed to write pagination continuation: "+err.Error())
+					return "", "", "", olterr.New(olterr.TypeConnection, "failed to write pagination continuation: "+err.Error())
 				}
 				if !quietTimer.Stop() {
 					select {
@@ -237,33 +362,17 @@ func waitForPrompt(source *DataSource, command, promptText string, timeout time.
 			if newPrompt == "" {
 				newPrompt = promptText
 			}
-			return stripEchoAndPrompt(settled, command, newPrompt), newPrompt, nil
+			// No outgoing carry here (contrast the substring-match branch
+			// above): reaching this branch already required
+			// commandQuiescenceMs (2s) of silence with nothing further
+			// arriving -- a much stronger "the device is truly done"
+			// signal than an instant substring match, so there's nothing
+			// left to carry forward by construction.
+			return cleanOutput(stripTrailingPromptOccurrence(settled, newPrompt)), newPrompt, "", nil
 		case <-timer.C:
-			return "", "", olterr.New(olterr.TypeTimeout, "Timed out waiting for prompt after \""+command+"\"")
+			return "", "", "", olterr.New(olterr.TypeTimeout, "Timed out waiting for prompt after \""+command+"\"")
 		}
 	}
-}
-
-// stripEchoAndPrompt: the device echoes the command back as the first line
-// (standard for both SSH and Telnet interactive shells), and the response
-// ends with the prompt reappearing. Strip both so callers get just the
-// command's real output.
-func stripEchoAndPrompt(raw, command, promptText string) string {
-	text := raw
-	if idx := strings.Index(text, command); idx != -1 {
-		text = text[idx+len(command):]
-	}
-	// Strip the trailing prompt (last occurrence, since output could
-	// legitimately contain the prompt substring earlier -- unlikely but
-	// not impossible for a generic driver with no vendor knowledge).
-	if idx := strings.LastIndex(text, promptText); idx != -1 {
-		text = text[:idx]
-	}
-	text = strings.TrimPrefix(text, "\r\n")
-	text = strings.TrimPrefix(text, "\n")
-	text = strings.TrimSuffix(text, "\r\n")
-	text = strings.TrimSuffix(text, "\n")
-	return stripPaginationMarkerLines(text)
 }
 
 // stripPaginationMarkerLines removes any line matching

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/onu-platform/olt-cli-gateway/internal/olterr"
+	"github.com/onu-platform/gearctl/internal/olterr"
 )
 
 // newScriptedSource builds a DataSource whose Write callback is caller-
@@ -31,7 +31,7 @@ func TestCapturePromptSuccess(t *testing.T) {
 		}()
 	})
 
-	prompt, err := capturePrompt(source, 2000)
+	prompt, err := capturePrompt(source, "", 2000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -40,14 +40,32 @@ func TestCapturePromptSuccess(t *testing.T) {
 	}
 }
 
+// TestCapturePromptUsesCarry confirms carry seeds the buffer -- a prior
+// call's leftover bytes must be treated as already-arrived data, not
+// silently dropped.
+func TestCapturePromptUsesCarry(t *testing.T) {
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		// The device sends nothing more -- everything needed is already
+		// in the carry.
+	})
+
+	prompt, err := capturePrompt(source, "\r\n\r\nOLT#", 200)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if prompt != "OLT#" {
+		t.Fatalf("got prompt %q, want %q (from carry alone)", prompt, "OLT#")
+	}
+}
+
 // TestCapturePromptIgnoresTrailingAsyncLogMessage is the regression test
 // for a real-hardware finding: a device pushed an unsolicited, bracketed-
 // timestamp system warning to the console AFTER the real prompt already
 // appeared, landing in the same quiescence window. A naive "last non-
 // blank line is the prompt" heuristic captured the warning instead of the
-// real "KRITIPUR-OLT>" prompt, silently breaking every downstream
-// decision that depends on the captured prompt (the ">"-suffix check for
-// enable-escalation, command completion matching).
+// real "KRITIPUR-OLT>" prompt, silently breaking everything downstream
+// that depends on it (enable-escalation's ">"-suffix check, command
+// completion matching).
 func TestCapturePromptIgnoresTrailingAsyncLogMessage(t *testing.T) {
 	source := newScriptedSource(func(written string, chunks chan<- []byte) {
 		go func() {
@@ -56,7 +74,7 @@ func TestCapturePromptIgnoresTrailingAsyncLogMessage(t *testing.T) {
 		}()
 	})
 
-	prompt, err := capturePrompt(source, 2000)
+	prompt, err := capturePrompt(source, "", 2000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -111,7 +129,7 @@ func TestCapturePromptNoOutputTimesOut(t *testing.T) {
 		// The device never responds at all.
 	})
 
-	_, err := capturePrompt(source, 50)
+	_, err := capturePrompt(source, "", 50)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -132,7 +150,7 @@ func TestWaitForPromptSuccess(t *testing.T) {
 		}()
 	})
 
-	output, nextPrompt, err := waitForPrompt(source, "show version", "OLT#", 2*time.Second)
+	output, nextPrompt, carry, err := waitForPrompt(source, "show version", "OLT#", "", 2*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -141,6 +159,9 @@ func TestWaitForPromptSuccess(t *testing.T) {
 	}
 	if nextPrompt != "OLT#" {
 		t.Fatalf("got nextPrompt %q, want %q (unchanged on a substring match)", nextPrompt, "OLT#")
+	}
+	if carry != "" {
+		t.Errorf("got carry %q, want \"\" (nothing trailed the match)", carry)
 	}
 }
 
@@ -174,7 +195,7 @@ func TestWaitForPromptContinuesThroughPagination(t *testing.T) {
 		}
 	})
 
-	output, nextPrompt, err := waitForPrompt(source, "show ont-info all", "OLT#", 5*time.Second)
+	output, nextPrompt, _, err := waitForPrompt(source, "show ont-info all", "OLT#", "", 5*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -208,7 +229,7 @@ func TestWaitForPromptDetectsChangedPrompt(t *testing.T) {
 		}()
 	})
 
-	output, nextPrompt, err := waitForPrompt(source, "config", "OLT>", 3*time.Second)
+	output, nextPrompt, carry, err := waitForPrompt(source, "config", "OLT>", "", 3*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -217,6 +238,9 @@ func TestWaitForPromptDetectsChangedPrompt(t *testing.T) {
 	}
 	if nextPrompt != "OLT(config)#" {
 		t.Fatalf("got nextPrompt %q, want %q", nextPrompt, "OLT(config)#")
+	}
+	if carry != "" {
+		t.Errorf("got carry %q, want \"\" (quiescence fallback has nothing left to carry)", carry)
 	}
 }
 
@@ -238,7 +262,7 @@ func TestWaitForPromptFallbackWaitsForOutputToStart(t *testing.T) {
 		}()
 	})
 
-	output, nextPrompt, err := waitForPrompt(source, "slow", "OLT#", 5*time.Second)
+	output, nextPrompt, _, err := waitForPrompt(source, "slow", "OLT#", "", 5*time.Second)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -250,12 +274,64 @@ func TestWaitForPromptFallbackWaitsForOutputToStart(t *testing.T) {
 	}
 }
 
+// TestWaitForPromptCarriesResidualBytesToNextCall is the regression test
+// for a real-hardware finding against a live Cisco ISR: a command with
+// essentially no real output ("terminal length 0") was followed by a
+// stray duplicate prompt redraw landing in the SAME read as its own
+// completion. This confirms the fix directly: cmd1's response bundles
+// both prompt occurrences in one chunk, cmd1 must still report only its
+// own real output plus a non-empty carry (the leftover second prompt),
+// and feeding that carry into cmd2's call must NOT corrupt cmd2's own
+// result -- proving the residue is absorbed as harmless pre-echo noise,
+// not misread as cmd2's completion.
+func TestWaitForPromptCarriesResidualBytesToNextCall(t *testing.T) {
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		switch {
+		case strings.Contains(written, "cmd1"):
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				// cmd1's own completion, PLUS a stray duplicate prompt
+				// redraw, both arriving in the very same read.
+				chunks <- []byte("cmd1\r\noutput1\r\nOLT#\r\nOLT#")
+			}()
+		case strings.Contains(written, "cmd2"):
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("cmd2\r\noutput2\r\nOLT#")
+			}()
+		}
+	})
+
+	output1, prompt1, carry1, err := waitForPrompt(source, "cmd1", "OLT#", "", 2*time.Second)
+	if err != nil {
+		t.Fatalf("cmd1: unexpected error: %v", err)
+	}
+	if output1 != "output1" {
+		t.Fatalf("cmd1: got output %q, want %q", output1, "output1")
+	}
+	if carry1 == "" {
+		t.Fatal("cmd1: expected a non-empty carry (the stray duplicate prompt redraw)")
+	}
+
+	output2, _, _, err := waitForPrompt(source, "cmd2", prompt1, carry1, 2*time.Second)
+	if err != nil {
+		t.Fatalf("cmd2: unexpected error: %v", err)
+	}
+	if output2 != "output2" {
+		t.Fatalf(
+			"cmd2: got output %q, want %q -- carried-over residue from cmd1 must be ignored as pre-echo "+
+				"noise, not misread as cmd2's own completion",
+			output2, "output2",
+		)
+	}
+}
+
 func TestWaitForPromptTimeout(t *testing.T) {
 	source := newScriptedSource(func(written string, chunks chan<- []byte) {
 		// The device never sends the prompt back.
 	})
 
-	_, _, err := waitForPrompt(source, "show version", "OLT#", 50*time.Millisecond)
+	_, _, _, err := waitForPrompt(source, "show version", "OLT#", "", 50*time.Millisecond)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -275,7 +351,7 @@ func TestWaitForPromptSessionClosed(t *testing.T) {
 		},
 	}
 
-	_, _, err := waitForPrompt(source, "show version", "OLT#", 2*time.Second)
+	_, _, _, err := waitForPrompt(source, "show version", "OLT#", "", 2*time.Second)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -285,41 +361,126 @@ func TestWaitForPromptSessionClosed(t *testing.T) {
 	}
 }
 
-func TestStripEchoAndPrompt(t *testing.T) {
+func TestFindEchoEnd(t *testing.T) {
 	cases := []struct {
-		name    string
-		raw     string
-		command string
-		prompt  string
-		want    string
+		name       string
+		buffer     string
+		command    string
+		searchFrom int
+		want       int
 	}{
 		{
-			name:    "strips leading echo and trailing prompt",
-			raw:     "show version\r\noutput line 1\r\noutput line 2\r\nOLT#",
-			command: "show version",
-			prompt:  "OLT#",
-			want:    "output line 1\r\noutput line 2",
+			name:       "found at the very start of the search region",
+			buffer:     "show version\r\noutput\r\nOLT#",
+			command:    "show version",
+			searchFrom: 0,
+			want:       len("show version"),
 		},
 		{
-			name:    "output containing the prompt substring only strips the last occurrence",
-			raw:     "cmd\r\nOLT# appears mid-output\r\nOLT#",
-			command: "cmd",
-			prompt:  "OLT#",
-			want:    "OLT# appears mid-output",
+			name:       "never searches before searchFrom -- a match only in carry is ignored",
+			buffer:     "show version\r\nshow version\r\noutput\r\nOLT#",
+			command:    "show version",
+			searchFrom: len("show version\r\n"),
+			want:       len("show version\r\n") + len("show version"),
 		},
 		{
-			name:    "no command echo present is a no-op for the strip-prefix step",
-			raw:     "just output\r\nOLT#",
-			command: "not-present",
-			prompt:  "OLT#",
-			want:    "just output",
+			name:       "not found at all",
+			buffer:     "just output\r\nOLT#",
+			command:    "not-present",
+			searchFrom: 0,
+			want:       -1,
 		},
 	}
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := stripEchoAndPrompt(tc.raw, tc.command, tc.prompt)
-			if got != tc.want {
+			if got := findEchoEnd(tc.buffer, tc.command, tc.searchFrom); got != tc.want {
+				t.Errorf("got %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCleanOutput(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want string
+	}{
+		{
+			name: "strips one leading and one trailing line ending",
+			text: "\r\noutput line 1\r\noutput line 2\r\n",
+			want: "output line 1\r\noutput line 2",
+		},
+		{
+			name: "strips an embedded pagination marker line",
+			text: "\r\nrow1\r\n--More--\r\nrow2\r\n",
+			want: "row1\r\nrow2",
+		},
+		{
+			name: "no leading/trailing artifacts is a no-op",
+			text: "just output",
+			want: "just output",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cleanOutput(tc.text); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStripTrailingPromptOccurrence(t *testing.T) {
+	cases := []struct {
+		name   string
+		text   string
+		prompt string
+		want   string
+	}{
+		{
+			name:   "strips a single trailing occurrence",
+			text:   "\r\noutput line 1\r\noutput line 2\r\n",
+			prompt: "OLT#",
+			// No occurrence present at all -- untouched.
+			want: "\r\noutput line 1\r\noutput line 2\r\n",
+		},
+		{
+			name:   "strips the trailing prompt",
+			text:   "\r\noutput here\r\nOLT#",
+			prompt: "OLT#",
+			want:   "\r\noutput here\r\n",
+		},
+		// TestStripTrailingPromptOccurrenceStripsRepeats (this case) is
+		// the regression test for a real-hardware finding: "show
+		// running-config" against a live Cisco ISR intermittently
+		// (~1-in-5 runs, not consistent) redraws its own prompt a second
+		// time immediately after the first, both landing in the same
+		// settled quiescence-fallback burst. A single strip left the
+		// inner, first redraw embedded in the returned text as if it were
+		// real trailing config content (observed live as a stray "ISR#"
+		// baked onto the end of an otherwise-correct config).
+		{
+			// Trailing "\r\n\r\n" left after the repeat-collapsing loop is
+			// intentional here -- this function's only job is removing
+			// repeated prompt occurrences; general whitespace cleanup is
+			// cleanOutput's responsibility, applied by the caller
+			// (waitForPrompt always wraps this call in cleanOutput).
+			name:   "repeated trailing prompt redraw is fully stripped, not just the outer occurrence",
+			text:   "\r\nline1\r\nline2\r\nend\r\n\r\nOLT#\r\n\r\nOLT#",
+			prompt: "OLT#",
+			want:   "\r\nline1\r\nline2\r\nend\r\n\r\n",
+		},
+		{
+			name:   "repeated trailing prompt redraw with no separating whitespace at all",
+			text:   "contentOLT#OLT#",
+			prompt: "OLT#",
+			want:   "content",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := stripTrailingPromptOccurrence(tc.text, tc.prompt); got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})

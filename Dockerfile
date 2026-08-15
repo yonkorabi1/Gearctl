@@ -10,7 +10,7 @@ RUN go mod download
 COPY main.go ./
 COPY internal/ ./internal/
 
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/olt-cli-gateway .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/gearctl .
 
 FROM alpine:3.20 AS runner
 
@@ -18,10 +18,12 @@ RUN apk add --no-cache ca-certificates && \
     addgroup -g 1001 -S oltgw && \
     adduser -S oltgw -u 1001
 
-COPY --from=builder /out/olt-cli-gateway /usr/local/bin/olt-cli-gateway
+COPY --from=builder /out/gearctl /usr/local/bin/gearctl
 
 USER oltgw
 
 EXPOSE 8090
 
-CMD ["olt-cli-gateway"]
+# gearctl is dual-mode (see main.go) -- default is a one-shot CLI
+# client, so the deployed container must explicitly opt into server mode.
+CMD ["gearctl", "-serve"]

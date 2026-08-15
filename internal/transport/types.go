@@ -34,6 +34,14 @@ type CommandResult struct {
 // MaxOutputBytes caps captured output per command before truncating -- see README.md.
 const MaxOutputBytes = 256 * 1024
 
+// Default timeouts, shared by every caller of ConnectionParams -- the HTTP
+// API (httpapi.ExecuteRequest/FactsRequest, for a caller that omits the
+// field) and the standalone CLI mode (main.go's flag defaults).
+const (
+	DefaultConnectTimeoutMs    = 10_000
+	DefaultPerCommandTimeoutMs = 15_000
+)
+
 // DataSource is the minimal byte-stream abstraction both SSH and Telnet
 // transports feed into the shared prompt-detection logic (promptdetector.go).
 // Chunks must never be dropped -- a buffered channel fed by one dedicated

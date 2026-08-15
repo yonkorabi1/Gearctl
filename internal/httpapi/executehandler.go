@@ -6,10 +6,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/onu-platform/olt-cli-gateway/internal/drivers"
-	"github.com/onu-platform/olt-cli-gateway/internal/olterr"
-	"github.com/onu-platform/olt-cli-gateway/internal/security"
-	"github.com/onu-platform/olt-cli-gateway/internal/transport"
+	"github.com/onu-platform/gearctl/internal/drivers"
+	"github.com/onu-platform/gearctl/internal/olterr"
+	"github.com/onu-platform/gearctl/internal/security"
+	"github.com/onu-platform/gearctl/internal/transport"
 )
 
 func ExecuteHandler(w http.ResponseWriter, r *http.Request) {

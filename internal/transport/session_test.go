@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/onu-platform/olt-cli-gateway/internal/olterr"
+	"github.com/onu-platform/gearctl/internal/olterr"
 )
 
 // TestStreamShellSessionTracksPromptAcrossModeChange is the end-to-end
@@ -59,6 +59,61 @@ func TestStreamShellSessionTracksPromptAcrossModeChange(t *testing.T) {
 	}
 	if out2 != "v1.0" {
 		t.Errorf("got output %q, want %q", out2, "v1.0")
+	}
+}
+
+// TestStreamShellSessionCarriesResidualBytesBetweenCommands is the
+// end-to-end regression test for the real-hardware finding that
+// motivated carry-forward in the first place: a low-output command (e.g.
+// "terminal length 0", used here as the -disable-paging command Open()
+// sends) can be followed by a stray duplicate prompt redraw landing in
+// the SAME read as its own completion. This is session-level -- not just
+// waitForPrompt in isolation -- because it's StreamShellSession's job to
+// actually THREAD the carry waitForPrompt/capturePrompt return into the
+// next call automatically; a session that silently dropped it would
+// reproduce exactly the misattribution bug this fixes.
+func TestStreamShellSessionCarriesResidualBytesBetweenCommands(t *testing.T) {
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		switch {
+		case written == crlf:
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("\r\n\r\nOLT#")
+			}()
+		case strings.Contains(written, "terminal length 0"):
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				// The device's completion PLUS a stray duplicate prompt
+				// redraw, both in the same burst.
+				chunks <- []byte("terminal length 0\r\nOLT#\r\nOLT#")
+			}()
+		case strings.Contains(written, "show version"):
+			go func() {
+				time.Sleep(10 * time.Millisecond)
+				chunks <- []byte("show version\r\nv1.0\r\nOLT#")
+			}()
+		}
+	})
+
+	session := NewStreamShellSession(source, func() error { return nil })
+	if err := session.Open(ConnectionParams{
+		ConnectTimeoutMs:     2000,
+		PerCommandTimeoutMs:  2000,
+		DisablePagingCommand: "terminal length 0",
+	}); err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	out, _, err := session.SendAndWaitForPrompt("show version", 3*time.Second)
+	if err != nil {
+		t.Fatalf("\"show version\" failed: %v", err)
+	}
+	if out != "v1.0" {
+		t.Errorf(
+			"got output %q, want %q -- the stray duplicate prompt after \"terminal length 0\" leaked into "+
+				"this command's detection window instead of being carried forward and ignored",
+			out, "v1.0",
+		)
 	}
 }
 

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/onu-platform/olt-cli-gateway/internal/olterr"
+	"github.com/onu-platform/gearctl/internal/olterr"
 )
 
 // ShellSession is the common contract both SSH and Telnet sessions
@@ -36,8 +36,13 @@ type ShellSession interface {
 type StreamShellSession struct {
 	source     *DataSource
 	promptText string
-	onClose    func() error
-	closed     bool
+	// carry: bytes waitForPrompt/capturePrompt read past the previous
+	// call's own match but didn't consume -- see waitForPrompt's doc
+	// comment. Threaded into every subsequent call's carry parameter so
+	// nothing read from the channel is ever silently dropped.
+	carry   string
+	onClose func() error
+	closed  bool
 }
 
 func NewStreamShellSession(source *DataSource, onClose func() error) *StreamShellSession {
@@ -45,11 +50,15 @@ func NewStreamShellSession(source *DataSource, onClose func() error) *StreamShel
 }
 
 func (s *StreamShellSession) Open(params ConnectionParams) error {
-	prompt, err := capturePrompt(s.source, params.ConnectTimeoutMs)
+	// "" -- nothing could possibly be carried in yet, this is the very
+	// first read on a fresh session.
+	prompt, err := capturePrompt(s.source, "", params.ConnectTimeoutMs)
 	if err != nil {
 		return err
 	}
 	s.promptText = prompt
+	// s.carry stays "" -- capturePrompt always fully drains until quiet,
+	// so it never has anything of its own left over.
 
 	// Enable-style privileged-mode escalation is NOT universal (Huawei and
 	// Junos-lineage CLIs have no such concept, and Junos's normal prompt
@@ -61,10 +70,11 @@ func (s *StreamShellSession) Open(params ConnectionParams) error {
 	// needs one if the device actually asks for one).
 	if isEnableStyleVendor(params.Vendor) && strings.HasSuffix(s.promptText, ">") {
 		log.Printf("enable: attempting for vendor=%q prompt=%q", params.Vendor, s.promptText)
-		nextPrompt, err := attemptEnable(
+		nextPrompt, newCarry, err := attemptEnable(
 			s.source,
 			s.promptText,
 			params.EnablePassword,
+			s.carry,
 			time.Duration(params.ConnectTimeoutMs)*time.Millisecond,
 		)
 		if err != nil {
@@ -73,6 +83,7 @@ func (s *StreamShellSession) Open(params ConnectionParams) error {
 		}
 		log.Printf("enable: done, prompt now %q", nextPrompt)
 		s.promptText = nextPrompt
+		s.carry = newCarry
 	} else {
 		log.Printf("enable: skipped for vendor=%q prompt=%q (vendor allowlisted=%v, prompt ends with '>'=%v)",
 			params.Vendor, s.promptText, isEnableStyleVendor(params.Vendor), strings.HasSuffix(s.promptText, ">"))
@@ -81,17 +92,23 @@ func (s *StreamShellSession) Open(params ConnectionParams) error {
 	if params.DisablePagingCommand != "" {
 		// Discard output -- this command's only purpose is to stop the
 		// device from blocking on a "--More--" style pager, not to report
-		// anything back to the caller.
-		_, nextPrompt, err := waitForPrompt(
+		// anything back to the caller. newCarry still matters, though --
+		// this is exactly the command that triggered the real-hardware
+		// finding motivating carry-forward (see waitForPrompt's doc
+		// comment): a low-output command like this one is where a stray
+		// trailing prompt redraw is most likely to land.
+		_, nextPrompt, newCarry, err := waitForPrompt(
 			s.source,
 			params.DisablePagingCommand,
 			s.promptText,
+			s.carry,
 			time.Duration(params.PerCommandTimeoutMs)*time.Millisecond,
 		)
 		if err != nil {
 			return err
 		}
 		s.promptText = nextPrompt
+		s.carry = newCarry
 	}
 	return nil
 }
@@ -100,15 +117,18 @@ func (s *StreamShellSession) SendAndWaitForPrompt(command string, timeout time.D
 	if s.closed {
 		return "", false, olterr.New(olterr.TypeProtocol, "Cannot send a command on a closed session")
 	}
-	output, nextPrompt, err := waitForPrompt(s.source, command, s.promptText, timeout)
+	output, nextPrompt, newCarry, err := waitForPrompt(s.source, command, s.promptText, s.carry, timeout)
 	if err != nil {
 		return "", false, err
 	}
 	// Re-derived every call, not just assumed unchanged -- see
 	// waitForPrompt's doc comment: a command can change the prompt itself
 	// (e.g. entering a config/privileged mode), and the next command needs
-	// to match against whatever the prompt actually is NOW.
+	// to match against whatever the prompt actually is NOW. carry is
+	// threaded the same way, for the same reason -- see StreamShellSession's
+	// doc comment on the carry field.
 	s.promptText = nextPrompt
+	s.carry = newCarry
 	if len(output) > MaxOutputBytes {
 		return truncateUTF8(output, MaxOutputBytes), true, nil
 	}
@@ -134,32 +154,47 @@ func (s *StreamShellSession) SendAndWaitForPrompt(command string, timeout time.D
 //     silently (no password needed), its prompt may already have
 //     changed, and callers need to track that.
 //
+// carry/returned newCarry follow waitForPrompt's carry-forward contract
+// (see its doc comment) -- if a password step is needed, whatever
+// waitForPrompt's own "enable" call left over is fed into the follow-up
+// capturePrompt call rather than dropped, since that's a second,
+// independent read that would otherwise never see it. If no password
+// step is needed, waitForPrompt's own newCarry is returned directly;
+// capturePrompt always fully drains, so there's never anything left over
+// coming out of the password-step branch.
+//
 // Callers are expected to have already decided this is worth trying
 // (vendor allowlist + prompt shape, see Open()); this function itself has
 // no vendor knowledge.
-func attemptEnable(source *DataSource, promptText, enablePassword string, timeout time.Duration) (string, error) {
-	output, candidatePrompt, err := waitForPrompt(source, "enable", promptText, timeout)
+func attemptEnable(
+	source *DataSource, promptText, enablePassword, carry string, timeout time.Duration,
+) (newPrompt string, newCarry string, err error) {
+	output, candidatePrompt, afterEnableCarry, err := waitForPrompt(source, "enable", promptText, carry, timeout)
 	if err != nil {
 		// A failure here (timeout, session closed) is still a real
 		// connection-level problem worth surfacing, same as any other
 		// command -- this isn't "enable didn't apply", it's "something
 		// went wrong sending it".
-		return "", err
+		return "", "", err
 	}
 	log.Printf("enable: device responded with output=%q candidatePrompt=%q", output, candidatePrompt)
 	if !passwordPattern.MatchString(candidatePrompt) {
-		return candidatePrompt, nil
+		return candidatePrompt, afterEnableCarry, nil
 	}
 	if enablePassword == "" {
-		return "", olterr.New(
+		return "", "", olterr.New(
 			olterr.TypeAuth,
 			`Device asked for a password after "enable", but no enable password is configured for this OLT`,
 		)
 	}
 	if err := source.Write(enablePassword + crlf); err != nil {
-		return "", olterr.New(olterr.TypeConnection, "failed to write enable password: "+err.Error())
+		return "", "", olterr.New(olterr.TypeConnection, "failed to write enable password: "+err.Error())
 	}
-	return capturePrompt(source, int(timeout/time.Millisecond))
+	prompt, err := capturePrompt(source, afterEnableCarry, int(timeout/time.Millisecond))
+	if err != nil {
+		return "", "", err
+	}
+	return prompt, "", nil
 }
 
 func (s *StreamShellSession) Close() error {

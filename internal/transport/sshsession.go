@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/onu-platform/olt-cli-gateway/internal/olterr"
+	"github.com/onu-platform/gearctl/internal/olterr"
 )
 
 // OpenSSHSession opens an SSH connection and an interactive shell channel

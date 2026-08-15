@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/onu-platform/olt-cli-gateway/internal/olterr"
+	"github.com/onu-platform/gearctl/internal/olterr"
 )
 
 const (
