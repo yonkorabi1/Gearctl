@@ -25,8 +25,35 @@ type mockSSHServer struct {
 	responses map[string]string
 	prompt    string
 
-	mu       sync.Mutex
-	stopping bool
+	mu         sync.Mutex
+	stopping   bool
+	ptyColumns uint32
+	ptyRows    uint32
+}
+
+// ptyRequestPayload mirrors RFC 4254's pty-req wire format (and
+// x/crypto/ssh's own unexported ptyRequestMsg) closely enough for
+// ssh.Unmarshal to decode a real client's request into it -- term
+// string, then width/height in CHARACTERS, then width/height in PIXELS,
+// then the encoded terminal-modes string. Field order matters here (it's
+// positional on the wire), field NAMES don't need to match the
+// unexported original.
+type ptyRequestPayload struct {
+	Term     string
+	Columns  uint32
+	Rows     uint32
+	Width    uint32
+	Height   uint32
+	Modelist string
+}
+
+// ptyDimensions returns the Columns/Rows the most recent pty-req actually
+// carried -- lets a test assert on what the client negotiated, not just
+// that pty-req happened at all.
+func (m *mockSSHServer) ptyDimensions() (columns, rows uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ptyColumns, m.ptyRows
 }
 
 func newMockSSHServer(username, password string, responses map[string]string) (*mockSSHServer, error) {
@@ -110,6 +137,13 @@ func (m *mockSSHServer) serveSession(channel ssh.Channel, requests <-chan *ssh.R
 	for req := range requests {
 		switch req.Type {
 		case "pty-req":
+			var payload ptyRequestPayload
+			if ssh.Unmarshal(req.Payload, &payload) == nil {
+				m.mu.Lock()
+				m.ptyColumns = payload.Columns
+				m.ptyRows = payload.Rows
+				m.mu.Unlock()
+			}
 			_ = req.Reply(true, nil)
 		case "shell":
 			_ = req.Reply(true, nil)

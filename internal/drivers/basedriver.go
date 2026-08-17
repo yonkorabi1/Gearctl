@@ -141,6 +141,66 @@ func (d *BaseDriver) RunCommandWithHint(command, expectedPrompt string) (transpo
 	}, nil
 }
 
+// RunCommandUntilComplete is RunCommandWithHint (no prompt hint -- this
+// isn't a mode-changing command, just a possibly-slow one), extended
+// with isComplete: if the underlying session implements
+// transport.CompletionAwareSession, waitForPrompt's quiescence-fallback
+// wait keeps extending itself (bounded by the overall per-command
+// timeout, same backstop as always) as long as isComplete(settled)
+// reports the accumulated output isn't finished yet, instead of
+// concluding completion the instant nothing new arrives for the
+// ordinary quiescence window.
+//
+// This exists for a real, live-reproduced device behavior: a large `|
+// display json` response on a loaded Juniper vMX can pause
+// mid-transmission longer than the ordinary quiescence window without
+// actually being done -- see JuniperDriver.runJSONCommand's doc comment
+// for the full story and how json.Valid is used as isComplete there.
+//
+// Falls back to plain RunCommandWithHint (no completeness awareness) if
+// the session doesn't implement transport.CompletionAwareSession -- e.g.
+// a test double that has no need to model this; every OTHER existing
+// caller/session is completely unaffected either way.
+func (d *BaseDriver) RunCommandUntilComplete(command string, isComplete func(settled string) bool) (transport.CommandResult, error) {
+	if d.session == nil {
+		return transport.CommandResult{}, olterr.New(olterr.TypeProtocol, "RunCommandUntilComplete() called before Connect()")
+	}
+
+	cas, ok := d.session.(transport.CompletionAwareSession)
+	if !ok {
+		return d.RunCommandWithHint(command, "")
+	}
+
+	startedAt := time.Now()
+	output, truncated, err := cas.SendAndWaitForPromptUntilComplete(
+		command,
+		time.Duration(d.params.PerCommandTimeoutMs)*time.Millisecond,
+		"",
+		isComplete,
+	)
+	if err != nil {
+		errClass := "session_closed"
+		if cliErr, ok := err.(*olterr.OltCliError); ok && cliErr.ErrType == olterr.TypeTimeout {
+			errClass = "timeout"
+		}
+		return transport.CommandResult{
+			Command:    command,
+			Output:     nil,
+			DurationMs: time.Since(startedAt).Milliseconds(),
+			Truncated:  false,
+			Error:      errClass,
+		}, nil
+	}
+
+	out := output
+	return transport.CommandResult{
+		Command:    command,
+		Output:     &out,
+		DurationMs: time.Since(startedAt).Milliseconds(),
+		Truncated:  truncated,
+	}, nil
+}
+
 func (d *BaseDriver) Disconnect() error {
 	if d.session == nil {
 		return nil

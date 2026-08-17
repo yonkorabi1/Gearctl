@@ -31,15 +31,27 @@ const crlf = "\r\n"
 
 // paginationMarkerPattern matches common "there's more, press a key"
 // pagination prompts used across vendors -- e.g. "--More--", "-- More --",
-// "(more)", "Press any key to continue". Deliberately broad enough to
-// catch dash/paren-decorated variants but NOT a bare trailing "more"
-// (too easy to false-positive on genuine output that happens to end with
-// that word). A false negative here just means paginated output looks
-// like any other quiescence-fallback case (silently truncated at the
-// pause, the pre-existing behavior); a false positive costs one harmless
-// extra continuation keystroke sent to a device that had nothing more to
-// show, which is a no-op.
-var paginationMarkerPattern = regexp.MustCompile(`(?i)-{2,}\s*more\s*-{2,}|\(\s*more\s*\)|press\s+any\s+key`)
+// "(more)", "Press any key to continue", and Junos's own
+// "---(more)---"/"---(more 10%)---" (dashes AND parens together, the
+// latter with a live progress percentage -- confirmed live against a
+// real Juniper vMX, Junos 18.2R1.9: `show version | display json`'s
+// output is long enough to paginate, and the unrecognized marker was
+// silently swallowed into the "output" as if it were real content, with
+// the rest of the response truncated -- the same class of bug
+// GetConfig's doc comment describes finding for Cisco). Deliberately
+// specific enough to require dashes together with parens for the Junos
+// case (not just a bare "(more)"), and NOT a bare trailing "more" (too
+// easy to false-positive on genuine output that happens to end with that
+// word -- see TestPaginationMarkerPattern's "3 more ONTs configured"/"row
+// of real data with more columns than usual" traps). A false negative
+// here just means paginated output looks like any other
+// quiescence-fallback case (silently truncated at the pause, the
+// pre-existing behavior); a false positive costs one harmless extra
+// continuation keystroke sent to a device that had nothing more to show,
+// which is a no-op.
+var paginationMarkerPattern = regexp.MustCompile(
+	`(?i)-{2,}\s*more\s*-{2,}|\(\s*more\s*\)|press\s+any\s+key|-{2,}\s*\(\s*more(?:\s+\d+\s*%)?\s*\)\s*-{2,}`,
+)
 
 // paginationContinueKeystroke is what advances a paginated CLI to the next
 // page -- a bare space with no line ending, matching the traditional
@@ -277,11 +289,27 @@ func stripTrailingPromptOccurrence(text, prompt string) string {
 // output can have brief pauses mid-stream (e.g. a "show" enumerating many
 // ONUs) that would otherwise look like premature completion.
 //
+// isComplete, if non-nil, gates ONLY the quiescence-fallback conclusion
+// (not the substring-match path, which is genuine prompt detection and
+// needs no such gate): when the quiet timer fires, if isComplete(settled)
+// returns false, this resets the quiet timer and keeps waiting instead
+// of concluding the device is done -- for a caller that knows its
+// command's output has a checkable "is this actually complete" shape
+// (e.g. a `| display json` command, where valid/complete JSON is a
+// cheap, reliable check) and has hit a real device-side pause exceeding
+// commandQuiescenceMs well before the response is actually finished.
+// nil preserves the exact prior behavior (conclude immediately once
+// nothing arrives for commandQuiescenceMs) -- every existing caller
+// passes nil and is unaffected. Bounded the same way regardless: the
+// overall per-command `timeout` still fires via timer.C no matter how
+// many times the quiescence check is deferred.
+//
 // On timeout, returns an olterr.OltCliError with Type "timeout" -- the
 // caller MUST treat the session as unusable afterward (see ShellSession's
 // contract).
 func waitForPrompt(
 	source *DataSource, command, promptText, carry string, timeout time.Duration,
+	isComplete func(settled string) bool,
 ) (output string, nextPrompt string, newCarry string, err error) {
 	if err := source.Write(command + crlf); err != nil {
 		return "", "", "", olterr.New(olterr.TypeConnection, "failed to write to session: "+err.Error())
@@ -358,6 +386,16 @@ func waitForPrompt(
 				quietTimer.Reset(commandQuiescenceMs * time.Millisecond)
 				continue
 			}
+			if isComplete != nil && !isComplete(settled) {
+				// The caller can tell this isn't actually finished yet,
+				// despite commandQuiescenceMs of silence -- a real,
+				// live-reproduced device behavior (see this parameter's
+				// own doc comment): keep waiting rather than concluding
+				// completion. Bounded by the overall per-command
+				// `timeout`, same backstop as everything else here.
+				quietTimer.Reset(commandQuiescenceMs * time.Millisecond)
+				continue
+			}
 			newPrompt := lastPromptLikeLine(settled)
 			if newPrompt == "" {
 				newPrompt = promptText
@@ -380,14 +418,47 @@ func waitForPrompt(
 // pagination continuations (see waitForPrompt) has one of these per page
 // boundary, sitting in the MIDDLE of the text, not just at the very end --
 // they're page-navigation noise, not part of the device's actual answer.
+// stripPaginationMarkerLines drops any \n-delimited "line" containing a
+// pagination marker -- except it doesn't just drop it blindly, because a
+// real device confirmed this isn't always safe: Junos (a real Juniper
+// vMX, Junos 18.2R1.9) erases its "---(more N%)---" marker IN PLACE with
+// a bare \r (no \n), then continues real content on what's technically
+// the same \n-delimited line, e.g.
+//
+//	---(more 3%)---\r                                        \r        {\r\n
+//
+// A naive whole-line drop here silently ate the real "        {" that
+// happened to share that line with the marker -- found live via `show
+// version | display json` (long enough to paginate), which came back
+// with a `{` missing from partway through the JSON, breaking it. Fixed
+// by resolving the \r-based overwrite first: keep only what's after the
+// LAST \r in the line (the final visual state of a simple
+// erase-and-rewrite sequence, the same convention a real terminal would
+// display). If real content survives that resolution, keep IT (not the
+// raw original line, not nothing); if nothing survives (the common
+// Cisco/Huawei case -- just "--More--\r" with nothing after), the line
+// is dropped entirely, same as before this fix.
 func stripPaginationMarkerLines(text string) string {
 	lines := strings.Split(text, "\n")
 	kept := make([]string, 0, len(lines))
 	for _, l := range lines {
-		if paginationMarkerPattern.MatchString(l) {
+		// Splitting on "\n" alone leaves a trailing "\r" on every line
+		// when the original text used "\r\n" endings -- that's just the
+		// other half of the CRLF, not part of any \r-based overwrite
+		// sequence, so it has to come off BEFORE hunting for the erase
+		// sequence's own \r's below (otherwise this trailing remnant is
+		// always the "last" \r found, and a real survivor never gets
+		// noticed).
+		trimmed := strings.TrimSuffix(l, "\r")
+		if !paginationMarkerPattern.MatchString(trimmed) {
+			kept = append(kept, l)
 			continue
 		}
-		kept = append(kept, l)
+		if idx := strings.LastIndex(trimmed, "\r"); idx != -1 {
+			if survivor := trimmed[idx+1:]; survivor != "" && !paginationMarkerPattern.MatchString(survivor) {
+				kept = append(kept, survivor)
+			}
+		}
 	}
 	return strings.Join(kept, "\n")
 }

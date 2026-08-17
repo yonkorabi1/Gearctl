@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -150,7 +151,7 @@ func TestWaitForPromptSuccess(t *testing.T) {
 		}()
 	})
 
-	output, nextPrompt, carry, err := waitForPrompt(source, "show version", "OLT#", "", 2*time.Second)
+	output, nextPrompt, carry, err := waitForPrompt(source, "show version", "OLT#", "", 2*time.Second, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -195,7 +196,7 @@ func TestWaitForPromptContinuesThroughPagination(t *testing.T) {
 		}
 	})
 
-	output, nextPrompt, _, err := waitForPrompt(source, "show ont-info all", "OLT#", "", 5*time.Second)
+	output, nextPrompt, _, err := waitForPrompt(source, "show ont-info all", "OLT#", "", 5*time.Second, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -229,7 +230,7 @@ func TestWaitForPromptDetectsChangedPrompt(t *testing.T) {
 		}()
 	})
 
-	output, nextPrompt, carry, err := waitForPrompt(source, "config", "OLT>", "", 3*time.Second)
+	output, nextPrompt, carry, err := waitForPrompt(source, "config", "OLT>", "", 3*time.Second, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -262,7 +263,7 @@ func TestWaitForPromptFallbackWaitsForOutputToStart(t *testing.T) {
 		}()
 	})
 
-	output, nextPrompt, _, err := waitForPrompt(source, "slow", "OLT#", "", 5*time.Second)
+	output, nextPrompt, _, err := waitForPrompt(source, "slow", "OLT#", "", 5*time.Second, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -271,6 +272,94 @@ func TestWaitForPromptFallbackWaitsForOutputToStart(t *testing.T) {
 	}
 	if nextPrompt != "OLT#" {
 		t.Fatalf("got nextPrompt %q, want %q", nextPrompt, "OLT#")
+	}
+}
+
+// TestWaitForPromptIsCompleteDefersQuiescenceConclusion is the
+// regression test for a real, live-reproduced bug against a Juniper
+// vMX: a large `| display json` response paused mid-transmission for
+// longer than commandQuiescenceMs, and the ORIGINAL quiescence fallback
+// (fires the instant nothing arrives for commandQuiescenceMs, no matter
+// what) concluded the device was done and returned a genuinely
+// incomplete response -- see JuniperDriver.runJSONCommand's doc comment
+// for the full story.
+//
+// Scripts exactly that pause: the device sends a deliberately incomplete
+// JSON fragment (an unclosed object), stays silent for longer than
+// commandQuiescenceMs (triggering the fallback with isComplete
+// non-nil), and only THEN sends the rest, including the real prompt.
+// isComplete (json.Valid here, deliberately not a full unmarshal, same
+// as JuniperDriver's own usage) must reject the fragment and keep
+// waiting instead of returning it as final -- the real completion is
+// then caught the ordinary way, via the ordinary substring-match branch
+// once the prompt actually reappears in a later chunk.
+func TestWaitForPromptIsCompleteDefersQuiescenceConclusion(t *testing.T) {
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		if !strings.Contains(written, "show interfaces") {
+			return
+		}
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			// Deliberately unclosed JSON object -- incomplete on its own.
+			chunks <- []byte("show interfaces\r\n{\"a\":1")
+		}()
+		go func() {
+			// Longer than commandQuiescenceMs -- without isComplete
+			// deferring the fallback, waitForPrompt would already have
+			// returned the incomplete fragment above by this point.
+			time.Sleep(commandQuiescenceMs*time.Millisecond + 300*time.Millisecond)
+			chunks <- []byte(",\"b\":2}\r\nOLT#")
+		}()
+	})
+
+	isComplete := func(settled string) bool {
+		return json.Valid([]byte(settled))
+	}
+
+	output, nextPrompt, carry, err := waitForPrompt(source, "show interfaces", "OLT#", "", 5*time.Second, isComplete)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if output != `{"a":1,"b":2}` {
+		t.Fatalf("got output %q, want the reassembled complete JSON %q", output, `{"a":1,"b":2}`)
+	}
+	if nextPrompt != "OLT#" {
+		t.Errorf("got nextPrompt %q, want %q", nextPrompt, "OLT#")
+	}
+	if carry != "" {
+		t.Errorf("got carry %q, want \"\" (nothing trailed the match)", carry)
+	}
+}
+
+// TestWaitForPromptIsCompleteNilPreservesOriginalBehavior confirms
+// passing isComplete=nil is a complete no-op change -- the quiescence
+// fallback still concludes immediately on the first quiet window, same
+// as every call site that predates isComplete existing.
+func TestWaitForPromptIsCompleteNilPreservesOriginalBehavior(t *testing.T) {
+	source := newScriptedSource(func(written string, chunks chan<- []byte) {
+		if !strings.Contains(written, "config") {
+			return
+		}
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			// A fragment that would NEVER satisfy a JSON-completeness
+			// check -- if isComplete were somehow still being consulted
+			// with a nil function, this would hang until the outer
+			// timeout instead of returning promptly via the ordinary
+			// quiescence fallback.
+			chunks <- []byte("config\r\nnot json at all\r\nOLT(config)#")
+		}()
+	})
+
+	output, nextPrompt, _, err := waitForPrompt(source, "config", "OLT>", "", 3*time.Second, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if output != "not json at all" {
+		t.Fatalf("got output %q, want %q", output, "not json at all")
+	}
+	if nextPrompt != "OLT(config)#" {
+		t.Errorf("got nextPrompt %q, want %q", nextPrompt, "OLT(config)#")
 	}
 }
 
@@ -302,7 +391,7 @@ func TestWaitForPromptCarriesResidualBytesToNextCall(t *testing.T) {
 		}
 	})
 
-	output1, prompt1, carry1, err := waitForPrompt(source, "cmd1", "OLT#", "", 2*time.Second)
+	output1, prompt1, carry1, err := waitForPrompt(source, "cmd1", "OLT#", "", 2*time.Second, nil)
 	if err != nil {
 		t.Fatalf("cmd1: unexpected error: %v", err)
 	}
@@ -313,7 +402,7 @@ func TestWaitForPromptCarriesResidualBytesToNextCall(t *testing.T) {
 		t.Fatal("cmd1: expected a non-empty carry (the stray duplicate prompt redraw)")
 	}
 
-	output2, _, _, err := waitForPrompt(source, "cmd2", prompt1, carry1, 2*time.Second)
+	output2, _, _, err := waitForPrompt(source, "cmd2", prompt1, carry1, 2*time.Second, nil)
 	if err != nil {
 		t.Fatalf("cmd2: unexpected error: %v", err)
 	}
@@ -331,7 +420,7 @@ func TestWaitForPromptTimeout(t *testing.T) {
 		// The device never sends the prompt back.
 	})
 
-	_, _, _, err := waitForPrompt(source, "show version", "OLT#", "", 50*time.Millisecond)
+	_, _, _, err := waitForPrompt(source, "show version", "OLT#", "", 50*time.Millisecond, nil)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -351,7 +440,7 @@ func TestWaitForPromptSessionClosed(t *testing.T) {
 		},
 	}
 
-	_, _, _, err := waitForPrompt(source, "show version", "OLT#", "", 2*time.Second)
+	_, _, _, err := waitForPrompt(source, "show version", "OLT#", "", 2*time.Second, nil)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -420,6 +509,33 @@ func TestCleanOutput(t *testing.T) {
 			name: "no leading/trailing artifacts is a no-op",
 			text: "just output",
 			want: "just output",
+		},
+		// Junos (a real Juniper vMX, Junos 18.2R1.9) erases its
+		// "---(more N%)---" marker in place with a bare \r (no \n), then
+		// continues real content on what's technically the same
+		// \n-delimited line -- confirmed live via `show version |
+		// display json`, long enough to paginate, which came back with a
+		// `{` silently missing from partway through the JSON before this
+		// fix (stripPaginationMarkerLines used to drop the WHOLE line,
+		// marker and the real "{" sharing it alike). This is the exact
+		// byte shape captured live (a raw Paramiko session dump), not a
+		// hand-simplified approximation.
+		{
+			name: "Junos's carriage-return erase of --(more N%)-- keeps real content sharing its line",
+			text: "\r\n        \"package-information\" : [\r\n---(more 3%)---\r                                        \r        {\r\n            \"name\" : [\r\n",
+			// Note the lone "\n" (not "\r\n") right after the survivor
+			// "{" -- the survivor itself has no trailing \r of its own
+			// (the erase sequence's own \r was consumed resolving it),
+			// unlike a normal line which keeps whatever \r\n it already
+			// had. Cosmetic only: downstream JSON parsing (this
+			// function's real motivating case) treats \r and \n
+			// identically as insignificant whitespace between tokens.
+			want: "        \"package-information\" : [\r\n        {\n            \"name\" : [",
+		},
+		{
+			name: "Junos's bare --(more)-- (no percentage) with nothing surviving the erase still vanishes",
+			text: "\r\nrow1\r\n---(more)---\r                \r\r\nrow2\r\n",
+			want: "row1\r\nrow2",
 		},
 	}
 	for _, tc := range cases {
@@ -499,6 +615,12 @@ func TestPaginationMarkerPattern(t *testing.T) {
 		{"( More )", true},
 		{"Press any key to continue", true},
 		{"press any key", true},
+		// Junos's own marker -- confirmed live against a real Juniper vMX
+		// (Junos 18.2R1.9): `show version | display json` paginates and
+		// shows exactly this, dashes and parens together, with a live
+		// progress percentage.
+		{"---(more 10%)---", true},
+		{"---(more)---", true},
 		{"row of real data with more columns than usual", false},
 		{"3 more ONTs configured", false},
 		{"OLT#", false},

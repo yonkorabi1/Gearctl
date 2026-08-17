@@ -64,7 +64,31 @@ func OpenSSHSession(params ConnectionParams) (ShellSession, error) {
 		ssh.TTY_OP_ISPEED: 14400,
 		ssh.TTY_OP_OSPEED: 14400,
 	}
-	if err := sshSession.RequestPty("vt100", 80, 40, modes); err != nil {
+	// x/crypto/ssh's RequestPty takes (term string, h, w int, ...) --
+	// HEIGHT then WIDTH, not the (width, height) order the two bare
+	// numbers below might suggest at a glance. This was previously
+	// swapped here (RequestPty("vt100", 80, 40, modes), i.e. 80 ROWS x 40
+	// COLUMNS instead of the intended 80-COLUMNS-wide terminal) -- a real
+	// bug confirmed live against a real Juniper vMX: with an effective
+	// 40-column width, Junos's CLI redraws/scrolls (its own "..." +
+	// tail-of-line convention, the same class of behavior any line-editor
+	// uses once the echoed prompt+command exceeds the terminal width) any
+	// command whose "prompt + command text" exceeds ~40 visible columns
+	// -- e.g. "rabi> show interfaces | display json" (37 chars) -- which
+	// splices leftover redraw bytes into the captured output BEFORE the
+	// real response and broke JSON parsing (`invalid character 's'
+	// looking for beginning of value`, the echoed tail of "display json"
+	// itself). Cisco's own commands tested here happened to all stay
+	// under 40 visible columns, which is why this went unnoticed until a
+	// longer Junos command ("show interfaces terse | display json", 37
+	// chars of command alone) crossed that threshold.
+	//
+	// 40 ROWS x 80 COLUMNS (correct order below) restores the actually-
+	// intended terminal size -- generously tall (more rows before a
+	// `--More--`-style pause than the conventional 24) and standard-width
+	// (80 columns, wide enough for any realistic single-line command this
+	// codebase sends without triggering a line-wrap redraw).
+	if err := sshSession.RequestPty("vt100", 40, 80, modes); err != nil {
 		sshSession.Close()
 		client.Close()
 		return nil, olterr.New(olterr.TypeProtocol, "Unable to request a pseudo-terminal: "+err.Error())

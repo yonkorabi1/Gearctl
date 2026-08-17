@@ -57,6 +57,18 @@ type ShellSession interface {
 	Close() error
 }
 
+// CompletionAwareSession is an OPTIONAL ShellSession capability -- not
+// part of the ShellSession interface itself, so adding it never breaks
+// an existing implementer (a test double, say) that has no need to model
+// it. A caller type-asserts a ShellSession against this to reach
+// SendAndWaitForPromptUntilComplete (see its own doc comment) when it's
+// available, and falls back to ordinary SendAndWaitForPromptHint
+// behavior otherwise -- see drivers.BaseDriver.RunCommandUntilComplete
+// for that fallback. StreamShellSession implements this.
+type CompletionAwareSession interface {
+	SendAndWaitForPromptUntilComplete(command string, timeout time.Duration, expectedPrompt string, isComplete func(settled string) bool) (output string, truncated bool, err error)
+}
+
 // StreamShellSession implements ShellSession on top of any DataSource (an
 // SSH shell channel or a raw Telnet socket, once each transport has
 // finished its own connection/auth handshake). All prompt-detection,
@@ -132,6 +144,7 @@ func (s *StreamShellSession) Open(params ConnectionParams) error {
 			s.promptText,
 			s.carry,
 			time.Duration(params.PerCommandTimeoutMs)*time.Millisecond,
+			nil,
 		)
 		if err != nil {
 			return err
@@ -147,6 +160,21 @@ func (s *StreamShellSession) SendAndWaitForPrompt(command string, timeout time.D
 }
 
 func (s *StreamShellSession) SendAndWaitForPromptHint(command string, timeout time.Duration, expectedPrompt string) (string, bool, error) {
+	return s.SendAndWaitForPromptUntilComplete(command, timeout, expectedPrompt, nil)
+}
+
+// SendAndWaitForPromptUntilComplete is SendAndWaitForPromptHint, but also
+// accepts isComplete -- see waitForPrompt's own doc comment on that
+// parameter for the real, live-reproduced device behavior it exists to
+// handle (a large, bursty response pausing mid-transmission longer than
+// the ordinary quiescence window). Exposed as its own method, not an
+// added parameter on SendAndWaitForPromptHint/the ShellSession interface
+// itself, so every existing caller (including test doubles implementing
+// ShellSession) is completely unaffected; see transport.CompletionAwareSession
+// for how a driver-layer caller reaches this optionally.
+func (s *StreamShellSession) SendAndWaitForPromptUntilComplete(
+	command string, timeout time.Duration, expectedPrompt string, isComplete func(string) bool,
+) (string, bool, error) {
 	if s.closed {
 		return "", false, olterr.New(olterr.TypeProtocol, "Cannot send a command on a closed session")
 	}
@@ -154,7 +182,7 @@ func (s *StreamShellSession) SendAndWaitForPromptHint(command string, timeout ti
 	if searchPrompt == "" {
 		searchPrompt = s.promptText
 	}
-	output, nextPrompt, newCarry, err := waitForPrompt(s.source, command, searchPrompt, s.carry, timeout)
+	output, nextPrompt, newCarry, err := waitForPrompt(s.source, command, searchPrompt, s.carry, timeout, isComplete)
 	if err != nil {
 		return "", false, err
 	}
@@ -213,7 +241,7 @@ func (s *StreamShellSession) CurrentPrompt() string {
 func attemptEnable(
 	source *DataSource, promptText, enablePassword, carry string, timeout time.Duration,
 ) (newPrompt string, newCarry string, err error) {
-	output, candidatePrompt, afterEnableCarry, err := waitForPrompt(source, "enable", promptText, carry, timeout)
+	output, candidatePrompt, afterEnableCarry, err := waitForPrompt(source, "enable", promptText, carry, timeout, nil)
 	if err != nil {
 		// A failure here (timeout, session closed) is still a real
 		// connection-level problem worth surfacing, same as any other

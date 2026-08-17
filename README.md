@@ -890,6 +890,7 @@ batch operations failed — `/v1/execute` and `/v1/batch` only), or
 | Vendor hint | Driver | Raw commands | Structured facts (`GetFacts()`) | Per-interface state (`GetInterfaces()`) | LLDP topology (`GetLLDPNeighbors()`) | Config retrieval (`GetConfig()`) | Full-config merge (`LoadConfig()`) | Delta merge (`LoadMergeCommands()`) |
 |---|---|---|---|---|---|---|---|---|
 | `cisco` | `CiscoIOSDriver` | ✅ | ✅ — verified live against a real Cisco ISRv (IOS-XE 17.01.01) | ✅ — verified live (`show interfaces`, up/administratively-down/description/IP-address/MTU/speed/MAC all confirmed against real output) | ✅ — header/trailer/zero-neighbor case verified live after enabling `lldp run`; **populated-neighbor row parsing built against the documented format only, not yet confirmed against a real neighbor device (no second LLDP-speaking device available in this lab)** | ✅ — `show running-config`, verbatim | ✅ — dry run only, mock-tested; **apply path not yet verified against real hardware, see [Merging a config change](#merging-a-config-change)** | ✅ — dry run AND apply both verified live (add/replace/`no`-removal on a real interface description); the diff is a projected preview, see [the `-merge-cmd` subsection](#-merge-cmd-pushing-just-the-commands-that-changed) |
+| `juniper` | `JuniperDriver` | ✅ — verified live against a real Juniper vMX (Junos 18.2R1.9): root SSH lands in the FreeBSD shell (`disablePagingCommand: "cli"` enters the Junos CLI), a paginated `show version \| display json` came back complete and valid (see [Pagination](#pagination) and [PTY size and large-response completeness](#pty-size-and-large-response-completeness) for the real bugs this surfaced and fixed) | ✅ — verified live (`show system information`/`show system uptime`/`show interfaces terse`, all via `\| display json`; model/os_version/serial_number/uptime/interface_list all confirmed against real output — see [juniperdriver.go](internal/drivers/juniperdriver.go)) | ✅ — verified live (`show interfaces terse` + `show interfaces`, both via `\| display json`; up/down, admin-enabled, MTU, speed, MAC, IP address all confirmed against real output; description confirmed live by deliberately setting one on a real interface, capturing the resulting JSON, then removing it again; 27/27 consecutive live `GetInterfaces()` calls succeeded after the PTY-size and completion-aware-wait fixes, see [PTY size and large-response completeness](#pty-size-and-large-response-completeness)) | ❌ — not implemented yet | ✅ — verified live, `show configuration`, verbatim (Junos's hierarchical curly-brace format, not `\| display json`) | ✅ — verified live, both dry-run AND apply (`configure private` → delta lines → Junos's own `show \| compare` diff → `commit check` → `commit`; a real committed interface-description change, verified present on the device, then reverted via `rollback 1`); candidate must be Junos's flat `set`/`delete` form, NOT `GetConfig()`'s own curly-brace output — see [Config push for Junos](#config-push-for-junos) | ✅ — same apply path as `LoadConfig()`, verified live the same way; `reverseCommands` is always exactly `["rollback 1"]`, Junos's own native undo, see [Config push for Junos](#config-push-for-junos) |
 | anything else (including `""`, `huawei`, `zte`, `nokia`, unknown vendors) | `RawDriver` | ✅ | ❌ — `error.type: "unsupported"` on `/v1/facts` | ❌ — `error.type: "unsupported"` on `/v1/interfaces` | ❌ — `error.type: "unsupported"` on `/v1/lldp-neighbors` | ❌ — `error.type: "unsupported"` on `/v1/config` | ❌ — `error.type: "unsupported"` on `/v1/merge-config` | ❌ — `error.type: "unsupported"` on `/v1/merge-cmd` |
 
 Raw command execution works against **any** vendor regardless of this
@@ -1229,9 +1230,215 @@ against real hardware, not from a spec read — see `replyToNegotiation`/
 
 Accept an optional `disablePagingCommand` in the request (e.g.
 `"screen-length 0 temporary"` for Huawei, `"terminal length 0"` for
-Cisco-style CLIs). If provided, it's sent first and its output discarded.
-If omitted, it's the caller's problem — it can also just be the first
-entry in `commands`.
+Cisco-style CLIs, `"cli"` for Junos -- see below). If provided, it's sent
+first and its output discarded. If omitted, it's the caller's problem —
+it can also just be the first entry in `commands`.
+
+**Junos's pagination marker is `---(more N%)---`** (a live progress
+percentage), recognized by `paginationMarkerPattern` alongside Cisco/
+Huawei-style `--More--`/`(more)`. A real Juniper vMX (Junos 18.2R1.9)
+surfaced a real bug here beyond just "recognize the marker": Junos erases
+it in place with a bare `\r` (no `\n`), then continues real content on
+what's technically the same `\n`-delimited line --
+`---(more 3%)---\r<spaces>\r        {\r\n` -- so a naive whole-line drop
+(`stripPaginationMarkerLines`'s original behavior) silently ate the real
+`{` sharing that line with the marker. Confirmed live: `show version |
+display json` (long enough to paginate) came back with a `{` missing
+from partway through the JSON, breaking it. Fixed by resolving the `\r`
+overwrite first — keep only what's after the *last* `\r` in the line —
+and keeping that survivor content instead of dropping the whole line,
+only actually dropping it if nothing survives (the ordinary Cisco/Huawei
+case). This is a generic transport-layer fix, not Junos-specific code —
+it benefits any device using this same carriage-return erase-in-place
+convention. See `stripPaginationMarkerLines`'s doc comment and
+`TestCleanOutput`'s Junos cases (byte-for-byte the real captured
+sequence, not a hand-simplified approximation).
+
+**For real usage against Junos, disable paging properly rather than
+relying on the page-by-page fallback above** — root SSH lands in the
+FreeBSD shell, not the Junos CLI, so `disablePagingCommand: "cli"` (or
+`-disable-paging "cli"` on the CLI) is what enters it; then send
+`set cli screen-length 0` as your first real command. Confirmed live:
+the identical `show version | display json` that took ~21s paging
+through 33 screens completed in ~3s with paging disabled properly,
+producing byte-for-byte the same valid, complete JSON either way — the
+pagination fix is a correctness guarantee for whatever a caller sends,
+not a substitute for disabling paging when you can.
+
+### PTY size and large-response completeness
+
+Two more real bugs this same live Juniper vMX session surfaced, both
+transport-layer (not Junos-specific — they benefit any vendor/command):
+
+**The requested PTY size was silently backwards.** `sshsession.go`'s
+`RequestPty` call is `(term string, h, w int, ...)` in
+`golang.org/x/crypto/ssh` — HEIGHT then WIDTH — but this codebase called
+it as `RequestPty("vt100", 80, 40, modes)`, which reads like "80 columns,
+40 rows" and actually negotiated the opposite: 80 ROWS x 40 COLUMNS. At
+an effective 40-column width, Junos's CLI line-wraps/redraws (its own
+"..." + tail-of-line convention) any command whose echoed `prompt +
+command text` exceeds that width — e.g. `rabi> show interfaces terse |
+display json` (43 characters) — splicing leftover redraw bytes into the
+captured output before the real response and breaking JSON parsing
+outright (`invalid character 's' looking for beginning of value`, the
+echoed tail of the command itself). Cisco's own commands tested here all
+happened to stay under 40 visible columns, which is why this went
+unnoticed until a longer Junos command crossed the threshold. Fixed by
+swapping the argument order (40, 80) — see
+`TestOpenSSHSessionRequestsWideEnoughPty`, which asserts the actual
+negotiated Columns/Rows against a mock server.
+
+**A large `| display json` response can pause mid-transmission longer
+than the ordinary quiescence window, even with paging correctly
+disabled.** Confirmed live, ~30 direct repro attempts against the same
+vMX: `show interfaces | display json` (~200KB) intermittently arrived in
+bursts with an internal pause exceeding `commandQuiescenceMs`'s 2-second
+window, and every failure was a clean mid-structure cutoff (`unexpected
+end of JSON input`, `expecting property name`) — the read loop concluding
+"no more bytes are coming" before they actually finished arriving, the
+same quiescence-fallback failure mode described above, just triggered by
+device-side burstiness on a large payload instead of by pagination. An
+earlier fix attempt retried by resending the whole command from scratch
+on an incomplete-looking result — it helped (roughly halved the failure
+rate) but was wasteful and, under heavier device load (this is a shared
+lab device), still left a meaningful failure rate (confirmed live:
+~25-35% even with 3 attempts).
+
+The actual fix targets the root cause instead: `waitForPrompt` now
+accepts an optional `isComplete(settled string) bool` predicate that
+gates ONLY the quiescence-fallback conclusion (the genuine
+prompt-reappeared substring match is untouched, since that's already
+authoritative) — if `isComplete` says the accumulated output isn't
+finished yet, the quiet timer resets and reading continues instead of
+concluding the device is done, bounded the whole time by the ordinary
+per-command timeout. Exposed via a new optional capability,
+`transport.CompletionAwareSession` (implemented by
+`StreamShellSession`, both SSH and Telnet), reached from the driver
+layer via `BaseDriver.RunCommandUntilComplete` — falls back to ordinary
+`RunCommandWithHint` behavior automatically if a session doesn't
+implement it (e.g. a test double), and every existing caller passing no
+predicate is completely unaffected. `JuniperDriver.runJSONCommand` uses
+`encoding/json.Valid` as `isComplete`. Confirmed live: 27/27 consecutive
+`GetInterfaces()` calls succeeded after this fix, up from ~65-75% with
+the resend-retry mitigation. See `TestWaitForPromptIsCompleteDefersQuiescenceConclusion`
+and `TestJuniperDriverRunJSONCommandUsesCompletionAwareSessionWhenAvailable`.
+
+### Config push for Junos
+
+`JuniperDriver` implements `ConfigLoader` (`LoadConfig()`/
+`LoadMergeCommands()`) using Junos's own native primitives instead of a
+heuristic reconciliation the way `CiscoIOSDriver` does:
+
+- **`configure private`**, not plain `configure` — confirmed live this
+  matters on a shared device: `configure` uses one candidate config
+  shared by every concurrent session (this lab device routinely has
+  several: `root terminal u0 ... idle 15:13:14`), so two sessions
+  editing at once would merge into the same pending changes. `private`
+  gives each session its own isolated candidate.
+- **The diff is Junos's own `show | compare`** — a real comparison the
+  device computes between the candidate and the committed config, not a
+  reconstruction. Confirmed live: `[edit interfaces ge-0/0/0 unit 0]` /
+  `+    description X;`.
+- **Apply is `commit check` (validate) then `commit`** — confirmed live:
+  `configuration check succeeds` / `commit complete`. A rejected line
+  (confirmed live: Junos's own `syntax error.`, which the CLI can print
+  more than once for one bad command as it validates incrementally
+  while "typing") or a failed check/commit triggers `rollback 0` +
+  `exit` — the private candidate is discarded, the device's committed
+  config is untouched.
+- **`reverseCommands` is always exactly `["rollback 1"]`** — Junos's own
+  "revert candidate to the state before the last commit" primitive.
+  Confirmed live: commit a description, verify it's really there via a
+  separate read, then `LoadMergeCommands(["rollback 1"], ...)` (the
+  exact same function, no special-casing) correctly reverts it and the
+  device shows no description again. Dramatically simpler and more
+  reliable than `CiscoIOSDriver.reverseCommands`' own per-line
+  heuristic derivation.
+- **`LoadConfig()`'s candidate must be Junos's flat `set`/`delete` form**
+  (e.g. from `show configuration | display set`), **NOT**
+  `GetConfig()`'s own curly-brace `show configuration` output — unlike
+  `CiscoIOSDriver`, where `GetConfig()`'s output is exactly what
+  `LoadConfig()` expects back, edited. This is deliberate: Junos's native
+  way to load a full hierarchical candidate is `load merge terminal`, an
+  interactive paste-then-Ctrl-D flow this driver does NOT attempt to
+  automate — a real early attempt at it left multiple SSH sessions
+  hung on this exact lab device (`request system logout terminal <pts>`
+  was needed to clean them up), since getting Ctrl-D delivery exactly
+  right over a scripted, non-interactive channel is a genuine foot-gun.
+  Flat `set`/`delete` form sidesteps that entirely: `LoadConfig()` is a
+  thin wrapper that splits candidate into lines and calls
+  `LoadMergeCommands()` with them — same safe, already-verified
+  per-line mechanism, no special multi-line input mode involved.
+
+**You don't send `configure private`/`commit check`/`commit` yourself —
+just the `set`/`delete` delta lines.** This is enforced, not just
+documented: a real live test included them anyway (an old-habit
+carryover from before this driver auto-managed those steps), and it
+turned out to be actively dangerous, not merely redundant —
+`applyJuniperMergeConfig` replays every line in the candidate for real,
+REGARDLESS of `dryRun` (dry-run only controls what happens *after*
+replay: discard vs. commit-check+commit), so an embedded `"commit"` line
+got committed for real during what should have been a safe, no-write
+dry-run preview — before the CLI ever asked "Type `apply` to confirm".
+`LoadMergeCommands`/`LoadConfig` now refuse outright (before ever calling
+`GetConfig` or connecting further) if the candidate contains a line
+matching `configure`/`configure private`/`configure exclusive`/
+`configure batch`/`commit`(` ...`) — confirmed live:
+
+```
+failed (validation): candidate contains "configure private", which LoadMergeCommands/LoadConfig
+already handle automatically (entering "configure private" and running "commit check"/"commit" at
+the right time, gated by dry-run/apply) -- including it yourself bypasses that safety flow entirely
+and can commit for real during what should be a safe dry-run preview -- just supply the set/delete
+delta lines
+```
+
+`"rollback N"` is deliberately exempt — it's the documented, legitimate
+way a caller replays `reverseCommands`.
+
+**Three more real bugs found live while building this, all fixed:**
+
+- Junos reprints a bare `[edit]` context line immediately before its own
+  prompt on every response while in configuration mode — confirmed live
+  that `show | compare`'s real captured output is
+  `[edit interfaces ge-0/0/0 unit 0]\n+    description X;\n\n[edit]`,
+  with that trailing `[edit]` being prompt-adjacent noise, not part of
+  the diff. `stripTrailingEditContext` removes ONLY a bare trailing
+  `[edit]` line, never a populated `[edit <path>]` header (which IS real
+  diff content).
+- `commit check`/`commit` do real device-side work and can take
+  noticeably longer than an ordinary config-mode command — confirmed
+  live, reproducible specifically when preceded by a realistic full
+  sequence (`GetConfig()` + `configure private` + delta lines + `show |
+  compare`): the ordinary quiescence-fallback wait concluded "done" on a
+  whitespace-only settled buffer moments before the real confirmation
+  text arrived, surfacing as `"commit check" failed ()` with an empty
+  reason. Fixed the same way as the large-JSON-response case above —
+  `RunCommandUntilComplete` with `isNonWhitespace` as `isComplete`,
+  deliberately NOT applied to commands that can correctly succeed with
+  empty output (a plain `set`/`delete` line, `show | compare` with no
+  diff, `rollback 0`).
+- `detectJunosRejection` only recognized Junos's `syntax error`
+  convention, missing its OTHER general rejection convention,
+  `error: ...` — confirmed live via a real SEMANTIC (not syntax) failure:
+  setting a second logical unit on an interface whose encapsulation only
+  allows unit 0 produced `error: configuration check-out failed`, which
+  silently slipped past detection during the per-line apply loop (only
+  this driver's own automatic `commit check` step downstream happened to
+  catch it, via a separate, unrelated `"check succeeds"` substring
+  check). Also, that trailing bare `[edit]` noise (previous bullet) was
+  leaking into user-facing rejection/error messages too, not just the
+  diff — both fixed together: `detectJunosRejection` now also matches
+  `error:`-prefixed lines, and strips `[edit]` noise before returning a
+  reason, applied consistently everywhere a rejection message is built.
+
+See `juniperdriver_configloader_test.go` for the full test suite
+(dry-run diff, rejection — both `syntax error` and the real semantic
+`error:` case, hash-freshness, commit-check/commit failure, the
+whitespace-completion recovery, `stripTrailingEditContext`, and the
+reserved-command-line refusal for every `configure`/`commit` variant) —
+all built from real captured Junos output, same as everywhere else in
+this driver.
 
 ### Security
 
@@ -1259,6 +1466,16 @@ go test ./...
 
 ## Testing
 
+`stripPaginationMarkerLines`'s Junos carriage-return-erase fix has
+dedicated `TestCleanOutput` cases using the byte-for-byte real sequence
+captured live from a Juniper vMX (a raw Paramiko session dump, not a
+hand-simplified approximation) -- one confirming real content sharing a
+line with the marker survives, one confirming the ordinary Cisco/Huawei
+case (nothing survives the erase) still vanishes entirely, same as
+before this fix. `TestPaginationMarkerPattern` covers the marker
+recognition itself (`---(more 10%)---`/`---(more)---`) alongside the
+existing Cisco/Huawei cases and false-positive traps.
+
 No real hardware needed for most of this — mock SSH (via
 `golang.org/x/crypto/ssh`'s server-side API) and mock Telnet (a raw
 `net.Listener`, including a `requireTtypeNegotiation` mode that reproduces
@@ -1280,6 +1497,36 @@ silently presented as equally trustworthy), plus a regression test for
 the real-hardware finding that this exact device initially replied
 "% LLDP is not enabled" before `lldp run` was applied -- confirming that
 surfaces as a distinct error rather than a silently-empty result.
+
+`JuniperDriver` (`juniperdriver_test.go`) is tested against real "|
+display json" output captured live against the same Juniper vMX: `show
+system information`/`show system uptime`/`show interfaces terse`/`show
+interfaces` fixtures cover `GetFacts()` (including `host-name` coming
+back as a present-but-empty `[{}]` on a device with no hostname
+configured -- a real shape, not a synthesized edge case) and
+`GetInterfaces()` (an interface with an IP found via `show interfaces
+terse`'s ready-made CIDR notation, a loopback with non-numeric `mtu:
+"Unlimited"` and no `speed` key at all, and an interface carrying a
+description -- confirmed live by deliberately setting one on a real
+interface, capturing the resulting JSON field, then removing it again so
+the device was left unchanged). `GetConfig()` is tested against real
+`show configuration` output (hierarchical curly-brace format, with the
+two real encrypted-password values swapped for placeholders -- the only
+intentional deviation from byte-for-byte capture anywhere in this
+driver's tests, since `GetConfig()` does no parsing at all and the
+literal hash values aren't load-bearing for the test). Truncated-JSON
+handling on both `GetInterfaces()` and `GetConfig()` is also covered --
+see `juniperdriver.go`'s doc comments for why a cut-off JSON response is
+refused outright rather than fed to `encoding/json` best-effort.
+`TestJuniperDriverRunJSONCommandUsesCompletionAwareSessionWhenAvailable`
+confirms `runJSONCommand` actually wires `encoding/json.Valid` through as
+`isComplete`, not just that it compiles -- see
+[PTY size and large-response completeness](#pty-size-and-large-response-completeness)
+for the live bug this exists to fix and
+`TestWaitForPromptIsCompleteDefersQuiescenceConclusion`/
+`TestWaitForPromptIsCompleteNilPreservesOriginalBehavior` (in
+`promptdetector_test.go`) for the mechanism itself, plus
+`TestOpenSSHSessionRequestsWideEnoughPty` for the PTY-size regression.
 
 `LoadConfig()`/`applyMergeConfig` (`mergeconfig_test.go`) are tested
 against a fake session double covering: the happy path; stopping on a

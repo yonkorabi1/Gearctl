@@ -148,3 +148,116 @@ func TestBaseDriverDisconnectClosesSession(t *testing.T) {
 		t.Fatalf("unexpected error on second Disconnect: %v", err)
 	}
 }
+
+// TestBaseDriverRunCommandUntilCompleteBeforeConnect mirrors
+// TestBaseDriverRunCommandsBeforeConnect for the new method.
+func TestBaseDriverRunCommandUntilCompleteBeforeConnect(t *testing.T) {
+	d := &BaseDriver{}
+	_, err := d.RunCommandUntilComplete("show version", nil)
+	if err == nil {
+		t.Fatal("expected an error when RunCommandUntilComplete is called before Connect")
+	}
+}
+
+// TestBaseDriverRunCommandUntilCompleteFallsBackWithoutCompletionAwareSession
+// is a regression test for RunCommandUntilComplete's documented fallback:
+// fakeShellSession does NOT implement transport.CompletionAwareSession
+// (SendAndWaitForPromptUntilComplete), so this must behave exactly like
+// RunCommandWithHint -- isComplete is simply never consulted, not an
+// error, not a hang.
+func TestBaseDriverRunCommandUntilCompleteFallsBackWithoutCompletionAwareSession(t *testing.T) {
+	fake := &fakeShellSession{responses: map[string]fakeResponse{
+		"show version": {output: "v1.0"},
+	}}
+	d := &BaseDriver{session: fake, params: transport.ConnectionParams{PerCommandTimeoutMs: 1000}}
+
+	isCompleteCalled := false
+	result, err := d.RunCommandUntilComplete("show version", func(string) bool {
+		isCompleteCalled = true
+		return true
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Output == nil || *result.Output != "v1.0" {
+		t.Errorf("result.Output = %v, want \"v1.0\"", result.Output)
+	}
+	if isCompleteCalled {
+		t.Error("isComplete should never be invoked when the session doesn't implement transport.CompletionAwareSession")
+	}
+}
+
+// fakeCompletionAwareSession is a minimal ShellSession +
+// transport.CompletionAwareSession double -- unlike fakeShellSession, it
+// implements SendAndWaitForPromptUntilComplete, recording the isComplete
+// function it was actually called with so a test can assert
+// RunCommandUntilComplete really threads it through rather than silently
+// dropping it.
+type fakeCompletionAwareSession struct {
+	response           fakeResponse
+	receivedIsComplete func(string) bool
+}
+
+func (f *fakeCompletionAwareSession) Open(transport.ConnectionParams) error { return nil }
+
+func (f *fakeCompletionAwareSession) SendAndWaitForPrompt(command string, timeout time.Duration) (string, bool, error) {
+	return f.SendAndWaitForPromptUntilComplete(command, timeout, "", nil)
+}
+
+func (f *fakeCompletionAwareSession) SendAndWaitForPromptHint(command string, timeout time.Duration, expectedPrompt string) (string, bool, error) {
+	return f.SendAndWaitForPromptUntilComplete(command, timeout, expectedPrompt, nil)
+}
+
+func (f *fakeCompletionAwareSession) SendAndWaitForPromptUntilComplete(
+	_ string, _ time.Duration, _ string, isComplete func(string) bool,
+) (string, bool, error) {
+	f.receivedIsComplete = isComplete
+	if f.response.err != nil {
+		return "", false, f.response.err
+	}
+	return f.response.output, f.response.truncated, nil
+}
+
+func (f *fakeCompletionAwareSession) CurrentPrompt() string { return "" }
+func (f *fakeCompletionAwareSession) Close() error          { return nil }
+
+// TestBaseDriverRunCommandUntilCompleteDelegatesToCompletionAwareSession
+// confirms the happy path: when the underlying session DOES implement
+// transport.CompletionAwareSession, RunCommandUntilComplete calls
+// SendAndWaitForPromptUntilComplete (not the plain Hint variant) and
+// passes the caller's isComplete straight through, unmodified.
+func TestBaseDriverRunCommandUntilCompleteDelegatesToCompletionAwareSession(t *testing.T) {
+	fake := &fakeCompletionAwareSession{response: fakeResponse{output: `{"a":1}`}}
+	d := &BaseDriver{session: fake, params: transport.ConnectionParams{PerCommandTimeoutMs: 1000}}
+
+	isComplete := func(s string) bool { return s == `{"a":1}` }
+	result, err := d.RunCommandUntilComplete("show interfaces | display json", isComplete)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Output == nil || *result.Output != `{"a":1}` {
+		t.Errorf("result.Output = %v, want %q", result.Output, `{"a":1}`)
+	}
+	if fake.receivedIsComplete == nil {
+		t.Fatal("expected SendAndWaitForPromptUntilComplete to receive a non-nil isComplete")
+	}
+	if !fake.receivedIsComplete(`{"a":1}`) {
+		t.Error("the isComplete function received wasn't the one actually passed in (or was called incorrectly)")
+	}
+}
+
+// TestBaseDriverRunCommandUntilCompleteClassifiesTimeoutError mirrors
+// RunCommandWithHint's own error-classing test -- same fail-fast-on-
+// timeout contract, just reached via the CompletionAwareSession path.
+func TestBaseDriverRunCommandUntilCompleteClassifiesTimeoutError(t *testing.T) {
+	fake := &fakeCompletionAwareSession{response: fakeResponse{err: olterr.New(olterr.TypeTimeout, "Timed out waiting for prompt")}}
+	d := &BaseDriver{session: fake, params: transport.ConnectionParams{PerCommandTimeoutMs: 1000}}
+
+	result, err := d.RunCommandUntilComplete("show interfaces | display json", func(string) bool { return true })
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "timeout" {
+		t.Errorf("result.Error = %q, want \"timeout\"", result.Error)
+	}
+}

@@ -12,6 +12,8 @@ func Resolve(vendor string) CliDriver {
 	switch strings.ToLower(strings.TrimSpace(vendor)) {
 	case "cisco":
 		return NewCiscoIOSDriver()
+	case "juniper":
+		return NewJuniperDriver()
 	default:
 		return NewRawDriver()
 	}

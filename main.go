@@ -997,6 +997,16 @@ func reportMergeConfig(
 	}
 	if !diffAlreadyShown {
 		fmt.Fprint(stdout, diff)
+		// Guarantee a line break before whatever's printed next --
+		// CiscoIOSDriver's difflib-based diffs always end with their own
+		// trailing "\n" already, but that's not guaranteed for every
+		// driver (JuniperDriver's diff is real, trimmed device output --
+		// see its own doc comments -- with no such guarantee), and this
+		// print site shouldn't have to assume one vendor's convention
+		// holds for all of them.
+		if !strings.HasSuffix(diff, "\n") {
+			fmt.Fprintln(stdout)
+		}
 	}
 	if applied {
 		fmt.Fprintln(stdout, "Applied.")

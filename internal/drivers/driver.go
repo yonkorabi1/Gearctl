@@ -13,30 +13,38 @@ import (
 // knowledge: connect, run whatever commands the caller asked for,
 // disconnect -- Resolve's fallback for any vendor without a dedicated
 // driver. CiscoIOSDriver ("cisco", see ciscoiosdriver.go) is the first
-// vendor-specific driver.
+// vendor-specific driver; JuniperDriver ("juniper", see
+// juniperdriver.go) is the second.
 //
 // Drivers add optional capabilities via type assertions rather than
 // interface methods every driver must stub out:
 //   - FactsProvider: vendor drivers parse `display`/`show` output into
 //     structured JSON (interface status, ONU list, optical levels).
-//     CiscoIOSDriver implements this today; more vendors add it as they're
-//     built.
+//     CiscoIOSDriver and JuniperDriver both implement this today; more
+//     vendors add it as they're built.
 //   - InterfaceProvider: richer per-interface state (up/down, enabled,
 //     description, MTU, speed, MAC) than FactsProvider's bare
-//     interface_list. CiscoIOSDriver implements this today.
+//     interface_list. CiscoIOSDriver and JuniperDriver both implement
+//     this today.
 //   - LLDPNeighborsProvider: topology discovery -- which local port sees
 //     which remote device/port over LLDP. CiscoIOSDriver implements this
-//     today.
+//     today; JuniperDriver does not yet.
 //   - ConfigGetter: fetch a device's running configuration verbatim (no
-//     parsing). CiscoIOSDriver implements this today.
+//     parsing). CiscoIOSDriver and JuniperDriver both implement this
+//     today.
 //   - ConfigLoader: config push (a merge/overlay onto the existing
 //     config, NOT an atomic replace -- see CiscoIOSDriver.LoadConfig's
 //     doc comment), gated behind a required dry-run-first, hash-checked
 //     apply flow. Deliberately higher-risk than ConfigGetter and kept as
 //     a separate interface so a driver can support reading config without
-//     being forced to stub out writing it. CiscoIOSDriver implements this
-//     today; user-facing surfaces call it "merge config", not "load
-//     config", to avoid implying replace semantics it doesn't have.
+//     being forced to stub out writing it. CiscoIOSDriver and
+//     JuniperDriver both implement this today -- Junos's own native
+//     `show | compare`/`commit check`/`commit`/`rollback` back
+//     JuniperDriver's version, a real device-generated diff/undo rather
+//     than CiscoIOSDriver's own heuristic text reconciliation (see
+//     JuniperDriver.LoadMergeCommands' doc comment). User-facing surfaces
+//     call it "merge config", not "load config", to avoid implying
+//     replace semantics it doesn't have.
 type CliDriver interface {
 	// Vendor identifier this driver claims to handle, or "*" for the
 	// generic/raw driver.
