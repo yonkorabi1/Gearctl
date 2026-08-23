@@ -14,6 +14,13 @@ func Resolve(vendor string) CliDriver {
 		return NewCiscoIOSDriver()
 	case "juniper":
 		return NewJuniperDriver()
+	case "extreme", "exos":
+		// "exos" is an explicit disambiguator: ExtremeDriver targets
+		// ExtremeXOS specifically, NOT Extreme's other CLI family
+		// (VOSS/Fabric Engine, modal like Cisco IOS) -- see
+		// extremedriver.go's doc comment. No dedicated VOSS driver exists
+		// yet, so "extreme" also resolves here rather than to RawDriver.
+		return NewExtremeDriver()
 	default:
 		return NewRawDriver()
 	}

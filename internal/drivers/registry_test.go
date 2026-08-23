@@ -14,6 +14,18 @@ func TestResolveKnownVendorsGetDedicatedDrivers(t *testing.T) {
 	}
 }
 
+func TestResolveKnownExtremeAliasesGetExtremeDriver(t *testing.T) {
+	for _, vendor := range []string{"extreme", "Extreme", "exos", "EXOS", "  extreme  "} {
+		d := Resolve(vendor)
+		if _, ok := d.(*ExtremeDriver); !ok {
+			t.Errorf("Resolve(%q) = %T, want *ExtremeDriver", vendor, d)
+		}
+		if got := d.Vendor(); got != "extreme" {
+			t.Errorf("Resolve(%q).Vendor() = %q, want \"extreme\"", vendor, got)
+		}
+	}
+}
+
 func TestResolveFallsBackToRawDriverForUnknownVendors(t *testing.T) {
 	for _, vendor := range []string{"", "huawei", "zte", "unknown-vendor"} {
 		d := Resolve(vendor)
