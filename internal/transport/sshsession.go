@@ -4,6 +4,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -113,15 +114,29 @@ func OpenSSHSession(params ConnectionParams) (ShellSession, error) {
 		return nil, olterr.New(olterr.TypeProtocol, "Failed to start shell: "+err.Error())
 	}
 
+	// stdinMu serializes writes to stdin -- the reader goroutine below
+	// answers cursor-position queries (see cursorposition.go) on its own,
+	// concurrently with whatever real command the caller is writing via
+	// source.Write, and both ultimately write the same stdin pipe.
+	var stdinMu sync.Mutex
+	writeStdin := func(data []byte) error {
+		stdinMu.Lock()
+		defer stdinMu.Unlock()
+		_, writeErr := stdin.Write(data)
+		return writeErr
+	}
+
 	chunks := make(chan []byte, 256)
 	go func() {
 		defer close(chunks)
 		buf := make([]byte, 4096)
+		var cprTail []byte
 		for {
 			n, readErr := stdout.Read(buf)
 			if n > 0 {
 				chunk := make([]byte, n)
 				copy(chunk, buf[:n])
+				cprTail = respondToCursorPositionQueries(writeStdin, cprTail, chunk)
 				chunks <- chunk
 			}
 			if readErr != nil {
@@ -133,8 +148,7 @@ func OpenSSHSession(params ConnectionParams) (ShellSession, error) {
 	source := &DataSource{
 		Chunks: chunks,
 		Write: func(data string) error {
-			_, writeErr := stdin.Write([]byte(data))
-			return writeErr
+			return writeStdin([]byte(data))
 		},
 	}
 

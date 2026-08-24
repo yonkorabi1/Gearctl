@@ -21,6 +21,11 @@ func Resolve(vendor string) CliDriver {
 		// extremedriver.go's doc comment. No dedicated VOSS driver exists
 		// yet, so "extreme" also resolves here rather than to RawDriver.
 		return NewExtremeDriver()
+	case "mikrotik", "routeros":
+		// "routeros" is an explicit alias: RouterOS is the CLI, MikroTik
+		// the vendor -- both hints are common in the wild, and there's
+		// only ever one driver either could mean.
+		return NewMikroTikDriver()
 	default:
 		return NewRawDriver()
 	}

@@ -26,6 +26,18 @@ func TestResolveKnownExtremeAliasesGetExtremeDriver(t *testing.T) {
 	}
 }
 
+func TestResolveKnownMikroTikAliasesGetMikroTikDriver(t *testing.T) {
+	for _, vendor := range []string{"mikrotik", "MikroTik", "routeros", "RouterOS", "  mikrotik  "} {
+		d := Resolve(vendor)
+		if _, ok := d.(*MikroTikDriver); !ok {
+			t.Errorf("Resolve(%q) = %T, want *MikroTikDriver", vendor, d)
+		}
+		if got := d.Vendor(); got != "mikrotik" {
+			t.Errorf("Resolve(%q).Vendor() = %q, want \"mikrotik\"", vendor, got)
+		}
+	}
+}
+
 func TestResolveFallsBackToRawDriverForUnknownVendors(t *testing.T) {
 	for _, vendor := range []string{"", "huawei", "zte", "unknown-vendor"} {
 		d := Resolve(vendor)
