@@ -1,0 +1,43 @@
+# Standalone deployment for gearctl, now that it lives in its own repo
+# (previously an in-tree overlay at genieacs's docker-compose.oltgw.yml).
+#
+# Stateless by design (see README.md) -- it holds no credentials or run
+# history of its own; a caller (e.g. platform-api's modules/olt-cli/)
+# supplies credentials per-request and owns all state.
+#
+# To interoperate with an existing genieacs/platform-api deployment on
+# another host or compose project, join whatever Docker network that
+# deployment's callers reach this service on -- e.g. if platform-api
+# expects `http://gearctl:8090`, either run this on the same external
+# network (see the commented `networks:` block below) or point
+# `OLT_GATEWAY_URL` at wherever this container actually ends up.
+#
+# Usage:
+#   GEARCTL_SHARED_SECRET=<secret> docker compose up -d
+# or set GEARCTL_SHARED_SECRET in a .env file alongside this one.
+
+services:
+  gearctl:
+    build: .
+    environment:
+      PORT: 8090
+      GEARCTL_SHARED_SECRET: ${GEARCTL_SHARED_SECRET:?Set GEARCTL_SHARED_SECRET in .env}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    # Deliberately no `ports:` mapping by default -- reachable only from
+    # other containers on whichever network is joined below. Uncomment to
+    # expose on the host directly instead:
+    # ports: ["8090:8090"]
+    networks: [genieacs_default]
+
+networks:
+  # External: this must already exist (created by whichever compose
+  # project owns the platform stack this gearctl instance serves). Change
+  # or remove this block entirely if running gearctl fully standalone,
+  # with no other services needing to reach it by the `gearctl` DNS name.
+  genieacs_default:
+    external: true

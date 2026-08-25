@@ -1,0 +1,5 @@
+# Local secrets -- never commit. Copy .env.example instead.
+.env
+
+# Build artifacts
+/gearctl
