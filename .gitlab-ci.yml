@@ -1,0 +1,134 @@
+# CI/CD for gearctl -- runs unit tests + security scans, then builds and
+# pushes a Docker image to this project's GitLab Container Registry, then
+# scans that image too. Build+push only, no auto-deploy: same reasoning as
+# genieacs's own pipeline (this stack talks to real network hardware, so
+# rolling a new image out to a host is a manual, human-triggered step).
+#
+# Much simpler than genieacs's pipeline, on purpose: this is a single Go
+# binary with one Dockerfile, not a monorepo with several independently
+# buildable images sharing build contexts and NEXT_PUBLIC_*-style
+# build-time secrets. No path-scoped `rules: changes:` needed either --
+# with one build target, every push should rebuild it.
+#
+# Unlike genieacs's CI, this one DOES run its own test suite directly
+# (`go test ./...`) rather than skipping it -- genieacs's compose-based
+# integration tests need a working nested `docker compose`, which this
+# runner's non-privileged config can't do (see genieacs's .gitlab-ci.yml
+# for the full investigation). gearctl's tests don't have that problem:
+# every *_test.go file in this repo (confirmed by reading them) uses fake
+# driver doubles and net/http/httptest -- pure in-process unit tests, no
+# real network calls, no Docker involved, so a plain `golang` image is
+# all the test stage needs.
+#
+# Build stage uses kaniko, not docker:dind, for the same reason genieacs's
+# does: this GitLab instance's runner doesn't have privileged mode enabled
+# ([runners.docker] privileged = true in the runner's own config.toml),
+# which nested Docker-in-Docker requires unconditionally to start at all --
+# confirmed dead on arrival there across multiple attempts. kaniko builds
+# and pushes from inside one container with no Docker daemon involved,
+# privileged or otherwise, sidestepping that entirely.
+#
+# Registry cleanup (pruning old SHA-tagged images) belongs in GitLab's own
+# Container Registry settings (Settings -> Packages & Registries ->
+# Container Registry -> cleanup policy), not a job here -- same as
+# genieacs.
+
+# Official GitLab security-scanning templates, same four genieacs uses --
+# each defines its own job(s) against their own scanner image
+# (registry.gitlab.com/security-products/*), no docker:dind or nested
+# `docker compose` involved anywhere. Dependency-Scanning's gemnasium
+# scanner supports Go via go.sum; SAST's semgrep auto-selects Go rules.
+# None of these fail the pipeline just for finding something -- findings
+# surface on the MR security widget/Vulnerability Report, same as
+# GitLab's docs describe. Add a blocking gate later if this project wants
+# findings to actually block merges.
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/Container-Scanning.gitlab-ci.yml
+
+stages:
+  - test
+  - build
+  - container_scan
+
+# ---------------------------------------------------------------------------
+# test stage
+# ---------------------------------------------------------------------------
+
+test:unit:
+  stage: test
+  image: golang:1.25-alpine
+  # go.mod's checksum verification needs git for some transitive deps'
+  # pseudo-versions; alpine's base image doesn't include it.
+  before_script:
+    - apk add --no-cache git
+  script:
+    - go vet ./...
+    - go test ./... -v -count=1
+
+# ---------------------------------------------------------------------------
+# build stage -- one image, this repo's own root Dockerfile (already a
+# proper multi-stage minimal build with a non-root user; there's no
+# separate dev/prod split here the way genieacs's monorepo has one).
+#
+# kaniko usage mirrors genieacs's .build_template exactly -- see that
+# file's own comments for why each flag/step is there (executor:debug for
+# a shell, entrypoint override, hand-written docker config.json since
+# there's no docker CLI in this image to `login` with, absolute
+# --context/--dockerfile paths). No --build-arg needed here at all: unlike
+# genieacs's platform-frontend (NEXT_PUBLIC_* baked in at build time),
+# gearctl's only secret (GEARCTL_SHARED_SECRET) is a plain runtime env var
+# per docker-compose.yml -- nothing this Dockerfile needs at build time.
+# ---------------------------------------------------------------------------
+
+build:gearctl:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  needs: ["test:unit"]
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    # SHA tag always pushed (traceable to an exact commit, the one to
+    # pin/roll back to); :latest additionally pushed only on `main` (this
+    # repo's sole branch today, but gating it the same way genieacs gates
+    # its own :latest to `dev` protects against a future feature branch
+    # silently overwriting what a deploy host pulls as :latest).
+    - DESTINATIONS="--destination ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        DESTINATIONS="$DESTINATIONS --destination ${CI_REGISTRY_IMAGE}:latest"
+      fi
+    - /kaniko/executor
+        --context "${CI_PROJECT_DIR}"
+        --dockerfile "${CI_PROJECT_DIR}/Dockerfile"
+        $DESTINATIONS
+
+# ---------------------------------------------------------------------------
+# container_scan stage -- Trivy (via the included Container-Scanning
+# template) against the image build:gearctl just pushed. Runs after build,
+# not in the test stage, since it needs an already-pushed image to scan.
+#
+# The template's auto-generated `container_scanning` job defaults to
+# scanning $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA (full SHA), which doesn't
+# match what build:gearctl actually pushed
+# ($CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA) -- disabled below in favor of
+# one explicit job pointed at the right tag, same pattern genieacs uses
+# for each of its own images.
+# ---------------------------------------------------------------------------
+
+container_scanning:
+  stage: container_scan
+  rules:
+    - when: never
+
+container_scan:gearctl:
+  extends: container_scanning
+  needs: ["build:gearctl"]
+  variables:
+    CS_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  rules:
+    - when: on_success
