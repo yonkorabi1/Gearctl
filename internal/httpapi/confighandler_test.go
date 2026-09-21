@@ -69,7 +69,7 @@ func TestConfigHandlerBlocksDisallowedTarget(t *testing.T) {
 func TestConfigHandlerReportsUnsupportedForVendorsWithoutConfigGetter(t *testing.T) {
 	rec, resp := postConfig(t, `{
 		"host": "10.0.0.1", "port": 22, "protocol": "ssh",
-		"vendor": "huawei",
+		"vendor": "zte",
 		"credentials": {"username": "a", "password": "b"}
 	}`)
 	if rec.Code != http.StatusOK {
@@ -115,7 +115,7 @@ func TestConfigHandlerSucceedsViaSession(t *testing.T) {
 
 func TestConfigHandlerReportsUnsupportedViaSession(t *testing.T) {
 	driver := &drivers.RawDriver{}
-	sessionID := openFakeSession(driver, "huawei")
+	sessionID := openFakeSession(driver, "zte")
 	defer func() { _ = sessionStore.Close(sessionID) }()
 
 	rec, resp := postConfig(t, fmt.Sprintf(`{"sessionId": %q}`, sessionID))

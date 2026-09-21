@@ -114,7 +114,7 @@ func TestMergeConfigHandlerBlocksDisallowedTarget(t *testing.T) {
 func TestMergeConfigHandlerReportsUnsupportedForVendorsWithoutConfigLoader(t *testing.T) {
 	rec, resp := postMergeConfig(t, `{
 		"host": "10.0.0.1", "port": 22, "protocol": "ssh",
-		"vendor": "huawei",
+		"vendor": "zte",
 		"credentials": {"username": "a", "password": "b"},
 		"candidate": "hostname R1\n", "dryRun": true
 	}`)
@@ -169,7 +169,7 @@ func TestMergeConfigHandlerSucceedsViaSession(t *testing.T) {
 
 func TestMergeConfigHandlerReportsUnsupportedViaSession(t *testing.T) {
 	driver := &drivers.RawDriver{}
-	sessionID := openFakeSession(driver, "huawei")
+	sessionID := openFakeSession(driver, "zte")
 	defer func() { _ = sessionStore.Close(sessionID) }()
 
 	rec, resp := postMergeConfig(t, fmt.Sprintf(`{"sessionId": %q, "candidate": "hostname R1\n", "dryRun": true}`, sessionID))

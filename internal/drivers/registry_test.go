@@ -38,8 +38,20 @@ func TestResolveKnownMikroTikAliasesGetMikroTikDriver(t *testing.T) {
 	}
 }
 
+func TestResolveKnownHuaweiAliasesGetHuaweiDriver(t *testing.T) {
+	for _, vendor := range []string{"huawei", "Huawei", "  HUAWEI  "} {
+		d := Resolve(vendor)
+		if _, ok := d.(*HuaweiDriver); !ok {
+			t.Errorf("Resolve(%q) = %T, want *HuaweiDriver", vendor, d)
+		}
+		if got := d.Vendor(); got != "huawei" {
+			t.Errorf("Resolve(%q).Vendor() = %q, want \"huawei\"", vendor, got)
+		}
+	}
+}
+
 func TestResolveFallsBackToRawDriverForUnknownVendors(t *testing.T) {
-	for _, vendor := range []string{"", "huawei", "zte", "unknown-vendor"} {
+	for _, vendor := range []string{"", "zte", "unknown-vendor"} {
 		d := Resolve(vendor)
 		if _, ok := d.(*RawDriver); !ok {
 			t.Errorf("Resolve(%q) = %T, want *RawDriver", vendor, d)

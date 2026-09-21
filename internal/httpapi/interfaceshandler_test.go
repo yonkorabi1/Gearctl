@@ -67,7 +67,7 @@ func TestInterfacesHandlerBlocksDisallowedTarget(t *testing.T) {
 func TestInterfacesHandlerReportsUnsupportedForVendorsWithoutInterfaceProvider(t *testing.T) {
 	rec, resp := postInterfaces(t, `{
 		"host": "10.0.0.1", "port": 22, "protocol": "ssh",
-		"vendor": "huawei",
+		"vendor": "zte",
 		"credentials": {"username": "a", "password": "b"}
 	}`)
 	if rec.Code != http.StatusOK {
@@ -118,7 +118,7 @@ func TestInterfacesHandlerSucceedsViaSession(t *testing.T) {
 
 func TestInterfacesHandlerReportsUnsupportedViaSession(t *testing.T) {
 	driver := &drivers.RawDriver{}
-	sessionID := openFakeSession(driver, "huawei")
+	sessionID := openFakeSession(driver, "zte")
 	defer func() { _ = sessionStore.Close(sessionID) }()
 
 	rec, resp := postInterfaces(t, fmt.Sprintf(`{"sessionId": %q}`, sessionID))

@@ -26,6 +26,8 @@ func Resolve(vendor string) CliDriver {
 		// the vendor -- both hints are common in the wild, and there's
 		// only ever one driver either could mean.
 		return NewMikroTikDriver()
+	case "huawei":
+		return NewHuaweiDriver()
 	default:
 		return NewRawDriver()
 	}

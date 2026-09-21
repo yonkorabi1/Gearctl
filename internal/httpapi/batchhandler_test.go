@@ -111,7 +111,7 @@ func TestBatchHandlerRejectsExecuteWithoutCommands(t *testing.T) {
 func TestBatchHandlerReportsUnsupportedPerOperationNotWholeBatch(t *testing.T) {
 	rec, resp := postBatch(t, `{
 		"host": "10.0.0.1", "port": 22, "protocol": "ssh",
-		"vendor": "huawei",
+		"vendor": "zte",
 		"credentials": {"username": "a", "password": "b"},
 		"operations": [{"type": "facts"}, {"type": "interfaces"}]
 	}`)

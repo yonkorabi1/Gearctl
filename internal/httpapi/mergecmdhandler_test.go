@@ -128,7 +128,7 @@ func TestMergeCmdHandlerBlocksDisallowedTarget(t *testing.T) {
 func TestMergeCmdHandlerReportsUnsupportedForVendorsWithoutConfigLoader(t *testing.T) {
 	rec, resp := postMergeCmd(t, `{
 		"host": "10.0.0.1", "port": 22, "protocol": "ssh",
-		"vendor": "huawei",
+		"vendor": "zte",
 		"credentials": {"username": "a", "password": "b"},
 		"commands": ["hostname R2"], "dryRun": true
 	}`)
@@ -178,7 +178,7 @@ func TestMergeCmdHandlerSucceedsViaSession(t *testing.T) {
 
 func TestMergeCmdHandlerReportsUnsupportedViaSession(t *testing.T) {
 	driver := &drivers.RawDriver{}
-	sessionID := openFakeSession(driver, "huawei")
+	sessionID := openFakeSession(driver, "zte")
 	defer func() { _ = sessionStore.Close(sessionID) }()
 
 	rec, resp := postMergeCmd(t, fmt.Sprintf(`{"sessionId": %q, "commands": ["hostname R2"], "dryRun": true}`, sessionID))
